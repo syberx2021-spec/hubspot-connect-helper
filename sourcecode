@@ -1,0 +1,867 @@
+// ==UserScript==
+// @name         PTG Connect Helper (HubSpot + LinkedIn)
+// @namespace    ptg-electronics
+// @version      1.2.0
+// @author       Patricia Camus (built with AI assistance from Claude by Anthropic)
+// @description  HubSpot task queue -> LinkedIn connection request with the PTG note -> Complete -> Next. One keypress per invite.
+// @match        https://*.hubspot.com/*
+// @match        https://www.linkedin.com/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_addValueChangeListener
+// @grant        GM_setClipboard
+// @grant        GM_registerMenuCommand
+// @noframes
+// @run-at       document-start
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /* ============================== SETTINGS ============================== */
+
+  // Connection note. LinkedIn allows up to 300 characters; this one is about 150.
+  const MESSAGE =
+    'Hi! I work in BD at PTG Electronics, an EMS partner in the Midwest. ' +
+    'We do PCBA, NPI, and box build for OEMs in your space. Would be good to connect.';
+
+  // How long "Already pending / connected" stays on screen before HubSpot is completed.
+  const AUTO_COMPLETE_DELAY_MS = 1500;
+
+  /* ===================================================================== */
+
+  const WORKER_NAME = 'PTG_LI_WORKER';
+  const WORKER_HASH = 'ptg-worker';
+  const KEY = { job: 'ptg_job', result: 'ptg_result', auto: 'ptg_auto', worker: 'ptg_worker_beat' };
+  const LI_PROFILE_RE = /linkedin\.com\/(in|pub|sales\/lead|sales\/people)\//i;
+  const ON_HUBSPOT = /(^|\.)hubspot\.com$/.test(location.hostname);
+  const ON_LINKEDIN = /(^|\.)linkedin\.com$/.test(location.hostname);
+
+  // Mark the LinkedIn tab opened from HubSpot as the helper tab (kept for every page it loads).
+  if (ON_LINKEDIN && location.hash.includes(WORKER_HASH)) {
+    try { sessionStorage.setItem('ptg_worker', '1'); } catch (_) { /* ignore */ }
+    window.name = WORKER_NAME;
+  }
+
+  /* ============================== HELPERS ============================== */
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const textOf = (el) => clean(el ? el.textContent : '');
+  const ariaOf = (el) => (el.getAttribute('aria-label') || '').toLowerCase();
+  const ours = (el) => !!(el && el.closest && el.closest('#ptg-helper'));
+  const autoOn = () => !!GM_getValue(KEY.auto, false);
+
+  function isVisible(el) {
+    if (!el || !el.isConnected || !el.getClientRects().length) return false;
+    return el.checkVisibility ? el.checkVisibility({ checkVisibilityCSS: true, visibilityProperty: true }) : true;
+  }
+
+  async function waitFor(fn, timeout = 10000, every = 250) {
+    const end = Date.now() + timeout;
+    while (Date.now() < end) {
+      try { const v = fn(); if (v) return v; } catch (_) { /* keep waiting */ }
+      await sleep(every);
+    }
+    return null;
+  }
+
+  function slugOf(url) {
+    try {
+      const path = decodeURIComponent(new URL(url, location.href).pathname).toLowerCase();
+      const m = path.match(/\/(?:in|pub)\/([^/]+)/);
+      return m ? m[1] : null;
+    } catch (_) { return null; }
+  }
+
+  // Elements whose own text node passes `test(rawText)`.
+  function textNodes(root, test) {
+    const out = [];
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: (n) => (test(n.nodeValue || '') ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP),
+    });
+    let n;
+    while ((n = walker.nextNode())) if (n.parentElement && !ours(n.parentElement)) out.push(n.parentElement);
+    return out;
+  }
+
+  /* =============================== PANEL =============================== */
+
+  // Solder-mask green with copper accents, so it never blends into HubSpot or LinkedIn.
+  const CSS = `
+#ptg-helper{all:initial;position:fixed;bottom:18px;z-index:2147483647;width:276px;box-sizing:border-box;
+  background:#0F3A2C;color:#E9F1EA;border:1px solid #1E5A45;border-radius:8px;
+  box-shadow:0 10px 30px rgba(4,20,14,.45);font:12.5px/1.45 "Segoe UI",system-ui,-apple-system,sans-serif}
+#ptg-helper *{box-sizing:border-box;font:inherit;color:inherit;letter-spacing:normal;text-transform:none}
+#ptg-helper.ptg-right{right:92px}
+#ptg-helper.ptg-left{left:18px}
+#ptg-helper .ptg-head{display:flex;align-items:center;justify-content:space-between;padding:7px 8px 7px 12px;border-bottom:1px solid #1E5A45}
+#ptg-helper .ptg-title{font-weight:600;color:#D9A066}
+#ptg-helper .ptg-min{all:unset;cursor:pointer;width:22px;height:22px;line-height:22px;text-align:center;border-radius:4px;color:#B7CDBF}
+#ptg-helper .ptg-min:hover{background:#174A39}
+#ptg-helper .ptg-body{padding:10px 12px 12px}
+#ptg-helper.ptg-collapsed .ptg-body{display:none}
+#ptg-helper .ptg-status{display:flex;align-items:center;gap:8px;font-weight:600;font-size:13.5px}
+#ptg-helper .ptg-dot{width:9px;height:9px;border-radius:50%;flex:none;background:#8FA89A}
+#ptg-helper .ptg-status[data-tone=ok] .ptg-dot{background:#5FD38D}
+#ptg-helper .ptg-status[data-tone=warn] .ptg-dot{background:#E8B04A}
+#ptg-helper .ptg-status[data-tone=err] .ptg-dot{background:#E5604D}
+#ptg-helper .ptg-sub{margin-top:4px;min-height:1.45em;color:#B7CDBF;overflow-wrap:anywhere}
+#ptg-helper .ptg-auto{display:flex;align-items:center;gap:8px;margin:10px 0 8px;cursor:pointer;user-select:none}
+#ptg-helper .ptg-auto input{appearance:auto;-webkit-appearance:checkbox;position:static;opacity:1;width:15px;height:15px;margin:0;accent-color:#D9A066}
+#ptg-helper .ptg-btns{display:flex;flex-wrap:wrap;gap:6px}
+#ptg-helper .ptg-btns button{all:unset;display:inline-block;cursor:pointer;padding:6px 10px;border-radius:5px;font-weight:600;
+  background:#174A39;color:#E9F1EA;border:1px solid #2A6B53}
+#ptg-helper .ptg-btns button:first-child{background:#C77D3A;border-color:#C77D3A;color:#1B120A}
+#ptg-helper .ptg-btns button:hover{filter:brightness(1.12)}
+#ptg-helper button:focus-visible{outline:2px solid #D9A066;outline-offset:2px}
+#ptg-helper .ptg-keys{display:grid;grid-template-columns:auto 1fr;gap:4px 8px;margin-top:10px;font-size:11.5px;color:#B7CDBF}
+#ptg-helper kbd{font-weight:600;color:#E9F1EA;background:#174A39;border:1px solid #2A6B53;border-radius:4px;padding:0 5px;white-space:nowrap}
+`;
+
+  function makePanel(side) {
+    const style = document.createElement('style');
+    style.textContent = CSS;
+    (document.head || document.documentElement).appendChild(style);
+
+    const box = document.createElement('div');
+    box.id = 'ptg-helper';
+    box.className = side === 'left' ? 'ptg-left' : 'ptg-right';
+    box.innerHTML = `
+      <div class="ptg-head"><span class="ptg-title">PTG connect helper</span><button type="button" class="ptg-min" title="Minimize">–</button></div>
+      <div class="ptg-body">
+        <div class="ptg-status" data-tone="info"><span class="ptg-dot"></span><span class="ptg-msg">Starting…</span></div>
+        <div class="ptg-sub"></div>
+        <label class="ptg-auto"><input type="checkbox"><span>Auto mode</span></label>
+        <div class="ptg-btns"></div>
+        <div class="ptg-keys"></div>
+      </div>`;
+    document.body.appendChild(box);
+
+    const $ = (s) => box.querySelector(s);
+    const auto = $('.ptg-auto input');
+    auto.checked = autoOn();
+    auto.addEventListener('change', () => GM_setValue(KEY.auto, auto.checked));
+    GM_addValueChangeListener(KEY.auto, (_k, _o, v) => { auto.checked = !!v; });
+
+    const minKey = `ptg_min_${side}`;
+    const applyMin = (m) => { box.classList.toggle('ptg-collapsed', !!m); $('.ptg-min').textContent = m ? '+' : '–'; };
+    applyMin(GM_getValue(minKey, false));
+    $('.ptg-min').addEventListener('click', () => {
+      const m = !box.classList.contains('ptg-collapsed');
+      GM_setValue(minKey, m);
+      applyMin(m);
+    });
+
+    return {
+      el: box,
+      status(msg, tone = 'info') { $('.ptg-msg').textContent = msg; $('.ptg-status').dataset.tone = tone; },
+      sub(msg) { $('.ptg-sub').textContent = msg || ''; },
+      button(label, fn) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = label;
+        b.addEventListener('click', fn);
+        $('.ptg-btns').appendChild(b);
+      },
+      keys(pairs) {
+        const k = $('.ptg-keys');
+        k.textContent = '';
+        for (const [key, what] of pairs) {
+          const kbd = document.createElement('kbd');
+          kbd.textContent = key;
+          const span = document.createElement('span');
+          span.textContent = what;
+          k.append(kbd, span);
+        }
+      },
+      show(v) { box.style.display = v ? '' : 'none'; },
+      keepAttached() { if (!box.isConnected) document.body.appendChild(box); },
+    };
+  }
+
+  function clickHard(el) {
+    const r = el.getBoundingClientRect();
+    const o = { bubbles: true, cancelable: true, button: 0, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+    try { el.dispatchEvent(new PointerEvent('pointerdown', { ...o, pointerType: 'mouse' })); } catch (_) { /* ignore */ }
+    el.dispatchEvent(new MouseEvent('mousedown', o));
+    try { el.dispatchEvent(new PointerEvent('pointerup', { ...o, pointerType: 'mouse' })); } catch (_) { /* ignore */ }
+    el.dispatchEvent(new MouseEvent('mouseup', o));
+    el.click();
+  }
+
+  function hotkeys(map) {
+    document.addEventListener('keydown', (e) => {
+      if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      const act = map[e.code];
+      if (!act) return;
+      e.preventDefault();
+      e.stopPropagation();
+      act();
+    }, true);
+  }
+
+  /* ============================== HUBSPOT ============================== */
+
+  function runHubSpot() {
+    if (!/^app/.test(location.hostname)) return; // only the HubSpot app, not help/marketing sites
+    console.info('[PTG connect helper] loaded on HubSpot');
+    const ui = makePanel('right');
+    ui.button('Open LinkedIn', () => sendJob(true));
+    ui.button('Complete & next', () => completeAndNext());
+    ui.button('Back', () => goBack());
+    ui.button('Skip', () => skipToNext());
+    ui.keys([
+      ['Alt+L', 'Open LinkedIn profile'],
+      ['Alt+X', 'Complete & next'],
+      ['Alt+B', 'Back to previous task'],
+      ['Alt+S', 'Skip to next'],
+    ]);
+
+    let currentUrl = null;
+    let prevUrl = null;
+    let lastKey = '';
+    let busy = false;
+    let token = 0;
+    let wasInQueue = false;
+    let reviewing = false; // true after Back: Auto stays paused so you can check
+
+    const taskId = () => new URLSearchParams(location.search).get('taskId');
+
+    function findTaskLabel() {
+      const hits = textNodes(document.body, (raw) => raw.includes('/') && /\d\s*\/\s*\d/.test(raw));
+      for (const start of hits) {
+        let el = start;
+        for (let i = 0; i < 3 && el; i++, el = el.parentElement) {
+          const t = textOf(el);
+          if (t.length > 25) break;
+          if (/^Task\s*\d+\s*\/\s*\d+$/i.test(t)) return el;
+        }
+      }
+      return null;
+    }
+    const labelText = () => textOf(findTaskLabel()) || 'Task';
+    const taskKey = () => taskId() || `${location.pathname}#${(labelText().match(/\d+/) || [''])[0]}`;
+
+    function findLinkedInUrl() {
+      const labels = textNodes(document.body, (raw) => /linkedin/i.test(raw) && /^\s*linkedin( profile)? url\s*$/i.test(raw));
+      for (const lab of labels) {
+        let el = lab;
+        for (let i = 0; i < 6 && el; i++, el = el.parentElement) {
+          const a = [...el.querySelectorAll('a[href]')].find((x) => LI_PROFILE_RE.test(x.href));
+          if (a) return a.href;
+          const m = textOf(el).match(/https?:\/\/[\w.]*linkedin\.com\/(?:in|pub)\/[^\s"'<>]+/i);
+          if (m) return m[0];
+        }
+      }
+      const a = [...document.querySelectorAll('a[href*="linkedin.com"]')].find((x) => LI_PROFILE_RE.test(x.href) && !ours(x));
+      return a ? a.href : null;
+    }
+
+    // The prospect's email from the contact card (LinkedIn asks for THEIR email, not ours).
+    const EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
+    const isOwnEmail = (e) => /@ptg-electronics\.com$/i.test(e);
+    function findContactEmail() {
+      const labels = textNodes(document.body, (raw) => /^\s*email\s*$/i.test(raw));
+      for (const lab of labels) {
+        let el = lab;
+        for (let i = 0; i < 4 && el; i++, el = el.parentElement) {
+          const found = (textOf(el).match(EMAIL_RE) || []).find((e) => !isOwnEmail(e));
+          if (found) return found;
+        }
+      }
+      const mail = [...document.querySelectorAll('a[href^="mailto:"]')]
+        .map((a) => decodeURIComponent(a.getAttribute('href').slice(7).split('?')[0]))
+        .find((e) => /@/.test(e) && !isOwnEmail(e));
+      return mail || null;
+    }
+
+    const findComplete = () =>
+      [...document.querySelectorAll('button, [role="button"]')].find(
+        (b) => /^complete$/i.test(textOf(b)) && !b.disabled && !ours(b) && isVisible(b)
+      );
+    const isCompleted = () =>
+      textNodes(document.body, (raw) => /completed/i.test(raw) && /^\s*completed\s*$/i.test(raw)).some(isVisible);
+    const isDisabled = (b) => !!b.disabled || b.getAttribute('aria-disabled') === 'true';
+
+    // The ‹ › arrows sit right after "Task N/M". Found by position, so icon-only buttons work.
+    function navArrows() {
+      const lab = findTaskLabel();
+      if (!lab) return null;
+      const r = lab.getBoundingClientRect();
+      const midY = r.top + r.height / 2;
+      const row = [...document.querySelectorAll('button, [role="button"]')]
+        .filter((b) => !ours(b) && isVisible(b))
+        .map((b) => ({ b, r: b.getBoundingClientRect() }))
+        .filter((x) => x.r.left >= r.right - 4 && x.r.left - r.right < 200 && x.r.top <= midY && x.r.bottom >= midY && x.r.width <= 64)
+        .sort((a, z) => a.r.left - z.r.left)
+        .map((x) => x.b);
+      const named = (re) => row.find((b) => re.test(`${ariaOf(b)} ${b.getAttribute('title') || ''}`));
+      const prev = named(/prev|back/i) || row[0] || null;
+      const next = named(/next|forward/i) || row[1] || null;
+      return prev || next ? { prev, next } : null;
+    }
+
+    async function clickArrow(which, startKey) {
+      const btn = await waitFor(() => {
+        const a = navArrows();
+        return a && a[which] && !isDisabled(a[which]) ? a[which] : null;
+      }, which === 'next' ? 6000 : 3000);
+      if (!btn) return 'none';
+      clickHard(btn);
+      return (await waitFor(() => taskKey() !== startKey, 10000)) ? 'moved' : 'stuck';
+    }
+
+    async function onTaskChange() {
+      const mine = ++token;
+      if (currentUrl) prevUrl = currentUrl;
+      currentUrl = null;
+      ui.status('Loading task…');
+      ui.sub('');
+      await sleep(800);
+      let url = await waitFor(() => { const u = findLinkedInUrl(); return u && u !== prevUrl ? u : null; }, 6000);
+      if (mine !== token) return;
+      if (!url) url = findLinkedInUrl();
+      currentUrl = url;
+      if (!url) {
+        ui.status(`${labelText()}: no LinkedIn URL`, 'warn');
+        ui.sub('Handle this one by hand, then Complete & next or Skip.');
+        return;
+      }
+      if (reviewing) {
+        ui.status(`${labelText()}: checking`, 'warn');
+        ui.sub('Auto is paused. Alt+L to view them on LinkedIn. Turn Auto back on to continue.');
+        return;
+      }
+      ui.status(`${labelText()}: ready`, 'ok');
+      ui.sub(url === prevUrl ? `Same LinkedIn as the last task, double-check: ${url}` : url);
+      if (autoOn()) sendJob(false);
+    }
+
+    function sendJob(fromClick) {
+      if (!currentUrl) currentUrl = findLinkedInUrl();
+      if (!currentUrl) { ui.status('This task has no LinkedIn URL', 'warn'); return; }
+      const workerAlive = Date.now() - GM_getValue(KEY.worker, 0) < 15000;
+      const useOpen = fromClick && !workerAlive;
+      GM_setValue(KEY.job, {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        url: currentUrl,
+        slug: slugOf(currentUrl),
+        email: findContactEmail(),
+        taskId: taskId(),
+        at: Date.now(),
+        opened: useOpen,
+      });
+      if (useOpen) window.open(`${currentUrl.split('#')[0]}#${WORKER_HASH}`, WORKER_NAME);
+      ui.status(`${labelText()}: opened on LinkedIn`, 'info');
+      ui.sub(workerAlive || useOpen ? currentUrl : 'LinkedIn helper tab not found. Click “Open LinkedIn” once.');
+    }
+
+    async function goNext(startKey) {
+      ui.status('Going to next task…');
+      const res = await clickArrow('next', startKey);
+      if (res === 'moved') return;
+      if (res === 'none') {
+        const m = labelText().match(/(\d+)\s*\/\s*(\d+)/);
+        if (m && m[1] === m[2]) {
+          GM_setValue(KEY.auto, false);
+          ui.status('End of the queue 🎉', 'ok');
+          ui.sub('Auto mode is off.');
+        } else {
+          ui.status('Couldn’t find the › arrow, click it yourself', 'err');
+        }
+        return;
+      }
+      ui.status('Next task didn’t load, check HubSpot', 'err');
+    }
+
+    async function goBack() {
+      if (busy) return;
+      busy = true;
+      try {
+        if (autoOn()) GM_setValue(KEY.auto, false);
+        reviewing = true;
+        ui.status('Going back…');
+        const res = await clickArrow('prev', taskKey());
+        if (res === 'none') ui.status('No previous task to go back to', 'warn');
+        else if (res === 'stuck') ui.status('Previous task didn’t load, check HubSpot', 'err');
+      } finally {
+        busy = false;
+      }
+    }
+
+    async function completeAndNext() {
+      if (busy) return;
+      busy = true;
+      try {
+        const startKey = taskKey();
+        if (!isCompleted()) {
+          const btn = findComplete();
+          if (!btn) { ui.status('Complete button not found, click it yourself', 'err'); return; }
+          btn.click();
+          ui.status('Completing…');
+          const ok = await waitFor(() => taskKey() !== startKey || isCompleted(), 8000);
+          if (!ok) { ui.status('Couldn’t confirm Complete, check HubSpot', 'err'); return; }
+          if (taskKey() !== startKey) return; // HubSpot moved on by itself
+          await sleep(500);
+        }
+        await goNext(startKey);
+      } finally {
+        busy = false;
+      }
+    }
+
+    async function skipToNext() {
+      if (busy) return;
+      busy = true;
+      try { await goNext(taskKey()); } finally { busy = false; }
+    }
+
+    // Results coming back from the LinkedIn tab.
+    GM_addValueChangeListener(KEY.result, (_k, _o, res, remote) => {
+      if (!remote || !res) return;
+      const job = GM_getValue(KEY.job, null);
+      if (!job || res.jobId !== job.id || job.taskId !== taskId()) return; // stale or for another task
+      if (res.status === 'stop') { ui.status('LinkedIn invite limit reached', 'err'); ui.sub('Auto mode is off.'); return; }
+      if (res.status === 'skip') skipToNext();
+      else if (res.status === 'back') goBack();
+      else completeAndNext();
+    });
+
+    hotkeys({
+      KeyL: () => { if (wasInQueue) sendJob(true); },
+      KeyX: () => { if (wasInQueue) completeAndNext(); },
+      KeyS: () => { if (wasInQueue) skipToNext(); },
+      KeyB: () => { if (wasInQueue) goBack(); },
+    });
+
+    // Turning Auto on (in either panel) ends review and sends the current task to LinkedIn.
+    GM_addValueChangeListener(KEY.auto, (_k, _o, on) => {
+      if (!on) return;
+      reviewing = false;
+      if (wasInQueue && !busy && currentUrl) sendJob(false);
+    });
+
+    setInterval(() => {
+      ui.keepAttached();
+      const inQueue = !!findTaskLabel() || !!taskId();
+      wasInQueue = inQueue;
+      if (!inQueue) {
+        // Panel stays visible so you can tell the script is running.
+        if (lastKey !== 'idle') {
+          lastKey = 'idle';
+          currentUrl = null;
+          ui.status('Waiting for the task queue');
+          ui.sub('Go to Tasks and click “Start tasks”.');
+        }
+        return;
+      }
+      const key = taskKey();
+      if (key && key !== lastKey) { lastKey = key; onTaskChange(); }
+    }, 1000);
+  }
+
+  /* ============================== LINKEDIN ============================= */
+
+  function runLinkedIn() {
+    GM_registerMenuCommand('Use this tab for PTG connect helper', () => {
+      try { sessionStorage.setItem('ptg_worker', '1'); } catch (_) { /* ignore */ }
+      window.name = WORKER_NAME;
+      location.reload();
+    });
+
+    const isWorker = () => {
+      try { if (sessionStorage.getItem('ptg_worker') === '1') return true; } catch (_) { /* ignore */ }
+      return window.name === WORKER_NAME;
+    };
+    if (!isWorker()) return; // only the helper tab gets the panel
+
+    const LABEL = {
+      sent: 'Invite sent',
+      pending: 'Already pending',
+      connected: 'Already connected',
+      done: 'Marked done',
+      skip: 'Skipped',
+      back: 'Going back',
+      stop: 'Stopped',
+    };
+
+    const ui = makePanel('left');
+    ui.button('Connect with note', () => prepareInvite());
+    ui.button('Mark done', () => report('done', true));
+    ui.button('Back', () => report('back', true));
+    ui.button('Skip', () => report('skip', true));
+    ui.keys([
+      ['Alt+C', 'Connect with note'],
+      ['Enter', 'Send, after checking the name'],
+      ['Alt+X', 'Mark done in HubSpot'],
+      ['Alt+B', 'Back to previous task'],
+      ['Alt+S', 'Skip to next task'],
+    ]);
+
+    let job = null;
+    let reported = false;
+    let autoTimer = null;
+    let current = null;
+    let person = '';
+    let warnNote = '';
+    let preparing = false;
+
+    const beat = () => { GM_setValue(KEY.worker, Date.now()); ui.keepAttached(); };
+    beat();
+    setInterval(beat, 5000);
+
+    /* ---------- reading the profile ---------- */
+
+    function nameFromPage() {
+      const title = clean(document.title.replace(/^\(\d+\+?\)\s*/, '')).split(' | ')[0].trim();
+      const root = document.querySelector('main') || document.body;
+      if (title && !/^linkedin$/i.test(title)) {
+        const first = title.split(' ')[0];
+        const el = textNodes(root, (raw) => raw.includes(first) && clean(raw) === title).find(isVisible);
+        if (el) return { name: title, el };
+      }
+      const h1 = [...root.querySelectorAll('h1')].find((h) => isVisible(h) && h.offsetHeight > 12 && textOf(h));
+      return h1 ? { name: textOf(h1), el: h1 } : null;
+    }
+
+    // Smallest block around the name that also holds the action buttons (Message / Connect / More).
+    function topCard(nameEl) {
+      const isAction = (b) =>
+        /^(message|connect|follow|following|pending|more)$/i.test(textOf(b)) || /more actions|to connect|pending/.test(ariaOf(b));
+      for (let el = nameEl, i = 0; el && el !== document.body && i < 15; el = el.parentElement, i++) {
+        if ([...el.querySelectorAll('button, a, [role="button"]')].some((b) => isAction(b) && isVisible(b))) return el;
+      }
+      return nameEl.closest('section') || document.querySelector('main') || document.body;
+    }
+
+    const candidates = (scope) =>
+      [...scope.querySelectorAll('button, a, [role="button"], [role="menuitem"], li, span')].filter(
+        (e) => !ours(e) && (e.hasAttribute('aria-label') || (e.textContent || '').length <= 40) && isVisible(e)
+      );
+
+    const hasFirstDegree = (card) =>
+      textNodes(card, (raw) => raw.includes('1st') && /^[·•]?\s*1st$|1st degree connection/i.test(clean(raw))).length > 0;
+
+    // strict = only trust elements that name this person (used when scanning the whole page).
+    function classify(els, ctx, strict) {
+      let connect = null;
+      for (const e of els) {
+        const aria = ariaOf(e);
+        const t = textOf(e).toLowerCase();
+        const href = (e.getAttribute('href') || '').toLowerCase();
+        const namesThem = !!ctx.first && aria.includes(ctx.first);
+        if ((!strict && t === 'remove connection') || (/remove (your )?connection/.test(aria) && (namesThem || !strict))) {
+          return { kind: 'connected' };
+        }
+        if ((!strict && t === 'pending') || (/^pending|withdraw invitation/.test(aria) && (namesThem || !strict))) {
+          return { kind: 'pending' };
+        }
+        if (connect) continue;
+        const invite = aria.match(/invite (.+?) to connect/);
+        if (invite) { if (!ctx.first || invite[1].includes(ctx.first)) connect = e; continue; }
+        if (href.includes('custom-invite')) { if (!strict || !ctx.slug || href.includes(ctx.slug)) connect = e; continue; }
+        if (!strict && t === 'connect') connect = e;
+      }
+      if (!connect) return null;
+      return { kind: 'connect', el: connect.closest('button, a, [role="button"], [role="menuitem"]') || connect };
+    }
+
+    function findMoreButton(card) {
+      const btns = [...card.querySelectorAll('button, [role="button"]')].filter((b) => !ours(b) && isVisible(b));
+      return (
+        btns.find((b) => /^more( actions)?$/.test(ariaOf(b)) || /^more$/i.test(textOf(b))) ||
+        btns.find((b) => /more actions/.test(ariaOf(b))) ||
+        null
+      );
+    }
+
+    function openMenu(more) {
+      const id = more.getAttribute('aria-controls');
+      const byId = id && document.getElementById(id);
+      if (byId && isVisible(byId)) return byId;
+      return [...document.querySelectorAll('[role="menu"], .artdeco-dropdown__content--is-open')]
+        .filter((m) => isVisible(m) && !ours(m))
+        .pop() || null;
+    }
+
+    function closeMenu(more) {
+      if (more.getAttribute('aria-expanded') === 'true' || openMenu(more)) more.click();
+    }
+
+    async function detectStatus(who) {
+      const card = topCard(who.el);
+      const ctx = { first: who.name.split(' ')[0].toLowerCase(), slug: slugOf(location.href) };
+      if (hasFirstDegree(card)) return { kind: 'connected' };
+      let st = classify(candidates(card), ctx, false);
+      if (st) return st;
+      const more = findMoreButton(card);
+      if (!more) return classify(candidates(document.body), ctx, true) || { kind: 'unknown' };
+      more.click();
+      st = await waitFor(() => {
+        const menu = openMenu(more);
+        return (
+          (menu && classify(candidates(menu), ctx, false)) ||
+          classify(candidates(card), ctx, false) ||
+          classify(candidates(document.body), ctx, true)
+        );
+      }, 3000);
+      if (!st || st.kind !== 'connect') closeMenu(more);
+      return st || { kind: 'unknown' };
+    }
+
+    /* ---------- invite dialog ---------- */
+
+    const dialogs = () =>
+      [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], .artdeco-modal')].filter((d) => !ours(d) && isVisible(d));
+    const inviteDialog = () =>
+      dialogs().filter((d) => /invit|add a note|personali[sz]e|connect/i.test(textOf(d))).pop() || null;
+
+    function limitHit() {
+      const t = dialogs().map(textOf).join(' ');
+      if (!/weekly invitation limit|invitation limit|reached the weekly limit|too many pending invitations/i.test(t)) return false;
+      GM_setValue(KEY.auto, false);
+      report('stop', true);
+      ui.status('LinkedIn invite limit reached', 'err');
+      ui.sub('Auto mode is off. Stop sending until the limit resets.');
+      return true;
+    }
+
+    function fillText(box, value) {
+      box.focus();
+      try { box.select(); } catch (_) { /* some input types can't select */ }
+      let ok = false;
+      try { ok = document.execCommand('insertText', false, value); } catch (_) { /* fall through */ }
+      if (!ok || box.value !== value) {
+        const proto = box instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+        setter.call(box, value);
+        box.dispatchEvent(new Event('input', { bubbles: true }));
+        box.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }
+
+    async function prepareInvite() {
+      if (preparing) return;
+      preparing = true;
+      try {
+        let st = current;
+        if (!st || st.kind !== 'connect' || !isVisible(st.el)) {
+          const who = nameFromPage();
+          if (!who) { ui.status('Profile hasn’t loaded yet', 'warn'); return; }
+          person = who.name;
+          st = await detectStatus(who);
+          current = st;
+        }
+        if (st.kind !== 'connect') {
+          ui.status(st.kind === 'unknown' ? 'No Connect button found' : LABEL[st.kind], 'warn');
+          return;
+        }
+
+        try { GM_setClipboard(MESSAGE, 'text'); } catch (_) { /* ignore */ }
+        st.el.click();
+
+        const dlg = await waitFor(inviteDialog, 6000);
+        if (!dlg) {
+          ui.status('Invite window didn’t open', 'warn');
+          ui.sub('Click Connect yourself. The note is on your clipboard (Ctrl+V).');
+          return;
+        }
+        if (limitHit()) return;
+
+        const emailSel = 'input[type="email"], input[name="email"]';
+        const wantsEmail = !!dlg.querySelector(emailSel);
+        const email = job && job.email;
+        if (wantsEmail && !email) {
+          ui.status('LinkedIn is asking for their email', 'warn');
+          ui.sub('This HubSpot contact has no email. Type it in, or press Alt+S to skip.');
+          return;
+        }
+
+        // Open the note box first (it can re-draw the dialog), then fill email and note.
+        let box = dlg.querySelector('textarea');
+        if (!box) {
+          const add = [...dlg.querySelectorAll('button')].find((b) => /add a (free )?note/i.test(`${ariaOf(b)} ${textOf(b)}`));
+          if (add) {
+            add.click();
+            box = await waitFor(() => { const d = inviteDialog(); return d && d.querySelector('textarea'); }, 5000);
+          }
+        }
+        if (limitHit()) return;
+
+        let filledEmail = '';
+        if (wantsEmail) {
+          const emailBox = (inviteDialog() || dlg).querySelector(emailSel);
+          if (emailBox) { fillText(emailBox, email); filledEmail = email; }
+        }
+        if (box) fillText(box, MESSAGE);
+        if (!box && !filledEmail) {
+          ui.status('Note box isn’t available', 'warn');
+          ui.sub('Send without a note, or press Alt+S to skip. The note is on your clipboard.');
+          return;
+        }
+
+        await sleep(300);
+        const d = inviteDialog();
+        const send = d && [...d.querySelectorAll('button')].find(
+          (b) => /^send( invitation| now)?$/i.test(textOf(b)) || /^send (invitation|now)$/.test(ariaOf(b))
+        );
+        const what = box && filledEmail ? 'Email and note ready' : box ? 'Note ready' : 'Email ready';
+        if (send && !send.disabled) {
+          send.focus();
+          ui.status(`${what}, press Enter to send`, 'ok');
+        } else {
+          ui.status(`${what}, click Send`, 'ok');
+        }
+        ui.sub(`Check it’s ${person}${filledEmail ? ` (${filledEmail})` : ''}${warnNote}.`);
+      } finally {
+        preparing = false;
+      }
+    }
+
+    // Your own click (or Enter) on Send is what triggers Complete in HubSpot.
+    document.addEventListener('click', (e) => {
+      if (!job || reported) return;
+      const b = e.target instanceof Element ? e.target.closest('button') : null;
+      if (!b || ours(b)) return;
+      const d = b.closest('[role="dialog"], .artdeco-modal');
+      if (!d || !/invit|add a note|personali[sz]e|connect/i.test(textOf(d))) return;
+      if (!/\bsend\b/i.test(`${ariaOf(b)} ${textOf(b)}`)) return;
+      afterSend(d);
+    }, true);
+
+    async function afterSend(d) {
+      ui.status('Sending…');
+      await waitFor(() => !isVisible(d), 6000);
+      await sleep(700);
+      if (limitHit()) return;
+      report('sent');
+    }
+
+    /* ---------- talking to HubSpot ---------- */
+
+    function report(status, force) {
+      if (!job) {
+        ui.status('No HubSpot task yet', 'warn');
+        ui.sub('Press Alt+L in the HubSpot task queue first.');
+        return;
+      }
+      if (reported && !force) return;
+      reported = true;
+      clearTimeout(autoTimer);
+      GM_setValue(KEY.result, { jobId: job.id, status, at: Date.now() });
+      if (status === 'stop') return;
+      if (status === 'back') {
+        ui.status('Going back in HubSpot', 'warn');
+        ui.sub('Auto is paused. Press Alt+L in HubSpot to view that task here.');
+        return;
+      }
+      ui.status(LABEL[status], 'ok');
+      ui.sub(autoOn() ? 'Updating HubSpot. The next profile will load here.' : 'Updating HubSpot. Press Alt+L there for the next one.');
+    }
+
+    async function start(j, mismatch) {
+      job = j;
+      reported = false;
+      current = null;
+      clearTimeout(autoTimer);
+      warnNote = mismatch ? ' (the link redirected, double-check)' : '';
+
+      if (!/^\/(in|pub)\//.test(location.pathname)) {
+        ui.status('This isn’t a regular profile page', 'warn');
+        ui.sub('Handle it by hand, then Alt+X (done) or Alt+S (skip).');
+        return;
+      }
+      ui.status('Reading profile…');
+      ui.sub('');
+      const who = await waitFor(nameFromPage, 15000);
+      if (job !== j) return;
+      if (!who) {
+        ui.status('Profile didn’t finish loading', 'err');
+        ui.sub('Handle it by hand, then Alt+X (done) or Alt+S (skip).');
+        return;
+      }
+      person = who.name;
+      ui.sub(person + warnNote);
+      await sleep(900); // let the buttons render
+
+      const st = await detectStatus(who);
+      if (job !== j) return;
+      current = st;
+
+      if (st.kind === 'connected' || st.kind === 'pending') {
+        ui.status(LABEL[st.kind], 'ok');
+        if (autoOn() && !mismatch) {
+          ui.sub(`${person}, completing in HubSpot…`);
+          autoTimer = setTimeout(() => report(st.kind), AUTO_COMPLETE_DELAY_MS);
+        } else {
+          ui.sub(`${person}. Press Alt+X to complete in HubSpot.`);
+        }
+        return;
+      }
+      if (st.kind === 'connect') {
+        ui.status('Not connected yet');
+        ui.sub(`${person}${warnNote}. Press Alt+C to connect.`);
+        if (autoOn()) prepareInvite();
+        return;
+      }
+      ui.status('No Connect button found', 'warn');
+      ui.sub(`${person}. Handle it by hand, then Alt+X (done) or Alt+S (skip).`);
+    }
+
+    GM_addValueChangeListener(KEY.job, (_k, _o, nj, remote) => {
+      if (!remote || !nj) return;
+      if (nj.opened) {
+        // HubSpot opened a fresh helper tab. If it wasn't this one, step aside.
+        setTimeout(() => {
+          try { sessionStorage.removeItem('ptg_worker'); } catch (_) { /* ignore */ }
+          window.name = '';
+          job = null;
+          ui.status('Another LinkedIn tab took over', 'warn');
+          ui.sub('You can close this tab.');
+        }, 4000);
+        return;
+      }
+      setTimeout(() => {
+        if (nj.slug && slugOf(location.href) === nj.slug) {
+          start(nj, false);
+        } else {
+          ui.status('Opening next profile…');
+          ui.sub('');
+          location.href = nj.url;
+        }
+      }, 300);
+    });
+
+    hotkeys({
+      KeyC: () => prepareInvite(),
+      KeyX: () => report('done', true),
+      KeyS: () => report('skip', true),
+      KeyB: () => report('back', true),
+    });
+
+    // On page load, pick up the task HubSpot sent.
+    const saved = GM_getValue(KEY.job, null);
+    const here = slugOf(location.href);
+    const fresh = saved && Date.now() - saved.at < 60000;
+    if (saved && saved.slug && here === saved.slug) start(saved, false);
+    else if (fresh && /^\/(in|pub)\//.test(location.pathname)) start(saved, !!saved.slug);
+    else if (fresh && !saved.slug) start(saved, false);
+    else {
+      ui.status('Waiting for HubSpot');
+      ui.sub('Start your task queue and press Alt+L there.');
+    }
+  }
+
+  /* ================================ BOOT =============================== */
+
+  function onReady(fn) {
+    if (document.body) fn();
+    else document.addEventListener('DOMContentLoaded', fn, { once: true });
+  }
+
+  onReady(() => {
+    if (ON_HUBSPOT) runHubSpot();
+    else if (ON_LINKEDIN) runLinkedIn();
+  });
+})();
