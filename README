@@ -90,6 +90,6 @@ The script is plain JavaScript with no dependencies. It uses Tampermonkey's `GM_
 
 ## Credits
 
-Designed and built by Patricia Camus with AI assistance from Claude (Anthropic). Patricia defined the workflow and requirements and tested the script against the live HubSpot queue. Claude helped design the approach and write the code.
+Designed and built by Eightrhio Camus with AI assistance from Claude (Anthropic). Patricia defined the workflow and requirements and tested the script against the live HubSpot queue. Claude helped design the approach and write the code.
 
 This project is not affiliated with HubSpot or LinkedIn. Use it in line with each platform's terms.
