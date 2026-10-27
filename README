@@ -2,7 +2,7 @@
 
 A Tampermonkey userscript that speeds up LinkedIn connection outreach from the HubSpot task queue. For each task, it reads the contact's LinkedIn URL and opens the profile. It then prepares a connection request with a personalized note. Once the invite is sent, it marks the HubSpot task complete and moves on to the next one.
 
-Built by **Patricia Camus** (Business Development, PTG Electronics) with AI assistance from **Claude by Anthropic**.
+Built by **Eightrhio Camus** (Business Development, PTG Electronics) with AI assistance from **Claude by Anthropic**.
 
 ## Why I built it
 
