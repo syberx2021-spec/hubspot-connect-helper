@@ -1,0 +1,95 @@
+# PTG Connect Helper
+
+A Tampermonkey userscript that speeds up LinkedIn connection outreach from the HubSpot task queue. For each task, it reads the contact's LinkedIn URL and opens the profile. It then prepares a connection request with a personalized note. Once the invite is sent, it marks the HubSpot task complete and moves on to the next one.
+
+Built by **Patricia Camus** (Business Development, PTG Electronics) with AI assistance from **Claude by Anthropic**.
+
+## Why I built it
+
+The manual routine for every task looked like this:
+
+1. Start the task.
+2. Open the LinkedIn link.
+3. Send a connection request with a note.
+4. Go back to HubSpot.
+5. Click Complete.
+6. Click the next arrow.
+
+Across a queue of more than 300 tasks, that adds up to a lot of tab switching and repetitive clicking. This script cuts each task down to a single keypress while still keeping a person in charge of every invite that goes out.
+
+## How it works
+
+The script runs two small panels that pass information to each other through Tampermonkey's shared storage. One panel sits on the HubSpot task queue. The other sits on a dedicated LinkedIn tab.
+
+| What the script finds on LinkedIn | What happens |
+|---|---|
+| Already connected | The HubSpot task is completed and the queue moves to the next task. |
+| Invitation already pending | Same as above. |
+| Not connected yet | The script clicks Connect and adds the note. If LinkedIn asks for the prospect's email, it fills that in from HubSpot. It then focuses the Send button. Once you press Enter, the task is completed and the queue moves on. |
+| No Connect option, or an unexpected page | The script pauses so you can handle the task by hand. |
+
+The final Send is always a human keypress, by design. It means someone checks that each invite is going to the right person. It also avoids fully automated invitations, which LinkedIn restricts.
+
+## Features
+
+**Auto mode** loads each profile on its own. It completes tasks for contacts who are already connected or pending. For new contacts, it leaves the invite ready to send.
+
+**Back** returns to the previous task so you can double-check your work. It pauses Auto mode automatically so the queue doesn't jump forward again. Turn Auto mode back on to continue from where you are.
+
+**Safety stops** prevent common mistakes:
+
+- If LinkedIn shows its invitation-limit warning, the script stops and turns off Auto mode.
+- If a task has no LinkedIn URL, the script flags it instead of guessing.
+- If a link redirects to a different profile, the script flags it instead of auto-completing.
+- The PTG sender address is never used as the prospect's email.
+
+## Installation
+
+1. Install the **Tampermonkey** extension for Chrome.
+2. Go to `chrome://extensions`, open Tampermonkey's **Details**, and turn on **Allow User Scripts**. On older versions of Chrome, turn on **Developer mode** instead.
+3. Open the Tampermonkey dashboard and create a new script.
+4. Replace the template with the contents of `ptg-connect-helper.user.js` and save.
+
+## Usage
+
+1. Open **Tasks** in HubSpot and start the task queue.
+2. Click **Open LinkedIn** in the green panel once. This opens the LinkedIn helper tab.
+3. Move that tab into its own window and place the HubSpot and LinkedIn windows side by side. Both need to stay visible, because Chrome slows down hidden tabs.
+4. Run a few tasks with Auto mode off to check that everything works.
+5. Turn Auto mode on.
+
+### Controls
+
+| Where | Key | Action |
+|---|---|---|
+| HubSpot | Alt+L | Open the task's LinkedIn profile |
+| HubSpot | Alt+X | Complete the task and go to the next one |
+| HubSpot | Alt+B | Go back to the previous task (pauses Auto mode) |
+| HubSpot | Alt+S | Skip to the next task without completing |
+| LinkedIn | Alt+C | Prepare the connection request with the note |
+| LinkedIn | Enter | Send the invite after checking the name |
+| LinkedIn | Alt+X | Mark the task done in HubSpot |
+| LinkedIn | Alt+B | Go back to the previous task in HubSpot |
+| LinkedIn | Alt+S | Skip to the next task |
+
+## Configuration
+
+The connection note and the timing values live in the **SETTINGS** block at the top of the script. LinkedIn allows notes of up to 300 characters.
+
+## Limitations
+
+**Page layout changes.** The script finds buttons by their text, accessibility labels, and position rather than by fixed CSS classes. Even so, a large redesign of HubSpot or LinkedIn may require updates.
+
+**Weekly invitation limits.** LinkedIn caps how many invitations an account can send each week. A long queue may need to be spread across several weeks.
+
+**Sequence tasks.** Completing a HubSpot sequence task advances the sequence. For example, completing an email task without sending the email skips that email step.
+
+## Tech
+
+The script is plain JavaScript with no dependencies. It uses Tampermonkey's `GM_*` APIs to pass messages between the HubSpot and LinkedIn tabs.
+
+## Credits
+
+Designed and built by Patricia Camus with AI assistance from Claude (Anthropic). Patricia defined the workflow and requirements and tested the script against the live HubSpot queue. Claude helped design the approach and write the code.
+
+This project is not affiliated with HubSpot or LinkedIn. Use it in line with each platform's terms.
