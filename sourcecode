@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         PTG Connect Helper (HubSpot + LinkedIn)
 // @namespace    ptg-electronics
-// @version      1.2.0
+// @version      1.3.0
 // @author       Patricia Camus (built with AI assistance from Claude by Anthropic)
-// @description  HubSpot task queue -> LinkedIn connection request with the PTG note -> Complete -> Next. One keypress per invite.
+// @description  HubSpot task queue -> LinkedIn connection request with the PTG note -> Complete -> Next. You press Enter to send every invite.
 // @match        https://*.hubspot.com/*
 // @match        https://www.linkedin.com/*
 // @grant        GM_getValue
@@ -11,6 +11,7 @@
 // @grant        GM_addValueChangeListener
 // @grant        GM_setClipboard
 // @grant        GM_registerMenuCommand
+// @grant        GM_openInTab
 // @noframes
 // @run-at       document-start
 // ==/UserScript==
@@ -20,63 +21,153 @@
 
   /* ============================== SETTINGS ============================== */
 
-  // Connection note. LinkedIn allows up to 300 characters; this one is about 150.
+  // Connection note. Free LinkedIn accounts allow 200 characters, Premium 300. This one is 148.
   const MESSAGE =
     'Hi! I work in BD at PTG Electronics, an EMS partner in the Midwest. ' +
     'We do PCBA, NPI, and box build for OEMs in your space. Would be good to connect.';
+
+  // Your own email domain. LinkedIn's email box asks for the PROSPECT's email,
+  // so an address on this domain is never typed into it.
+  const OWN_EMAIL_DOMAIN = 'ptg-electronics.com';
 
   // How long "Already pending / connected" stays on screen before HubSpot is completed.
   const AUTO_COMPLETE_DELAY_MS = 1500;
 
   /* ===================================================================== */
 
+  const VERSION = '1.3.0';
   const WORKER_NAME = 'PTG_LI_WORKER';
   const WORKER_HASH = 'ptg-worker';
-  const KEY = { job: 'ptg_job', result: 'ptg_result', auto: 'ptg_auto', worker: 'ptg_worker_beat' };
-  const LI_PROFILE_RE = /linkedin\.com\/(in|pub|sales\/lead|sales\/people)\//i;
+  const TAB_ID = Math.random().toString(36).slice(2, 10);
+  const KEY = {
+    job: 'ptg_job',
+    result: 'ptg_result',
+    auto: 'ptg_auto',
+    beat: 'ptg_worker_beat',
+    ping: 'ptg_ping',
+    pong: 'ptg_pong',
+    claim: 'ptg_worker_claim',
+    hs: 'ptg_hubspot_status',
+  };
   const ON_HUBSPOT = /(^|\.)hubspot\.com$/.test(location.hostname);
   const ON_LINKEDIN = /(^|\.)linkedin\.com$/.test(location.hostname);
 
-  // Mark the LinkedIn tab opened from HubSpot as the helper tab (kept for every page it loads).
+  // Mark the LinkedIn tab opened from HubSpot as the helper tab. Read at document-start,
+  // before LinkedIn rewrites the URL; kept in sessionStorage for every page the tab loads.
   if (ON_LINKEDIN && location.hash.includes(WORKER_HASH)) {
     try { sessionStorage.setItem('ptg_worker', '1'); } catch (_) { /* ignore */ }
     window.name = WORKER_NAME;
   }
 
-  /* ============================== HELPERS ============================== */
+  /* ========================= PLAIN TEXT HELPERS ========================= */
+
+  const clean = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  const normName = (s) =>
+    clean(String(s || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9 ]+/g, ' '));
+  const ownDomainRe = new RegExp(`@([a-z0-9-]+\\.)*${OWN_EMAIL_DOMAIN.replace(/\./g, '\\.')}$`, 'i');
+  const isOwnEmail = (e) => ownDomainRe.test(clean(e));
+  const EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
+
+  // Any LinkedIn profile link -> https://www.linkedin.com/in/<slug>/ (country subdomains, no protocol,
+  // tracking parameters and trailing punctuation all handled). Sales Navigator links are kept as they are.
+  function normalizeLinkedInUrl(raw) {
+    if (!raw) return null;
+    let s = clean(raw).replace(/[)\].,;'"]+$/, '');
+    if (!/^https?:\/\//i.test(s)) s = `https://${s.replace(/^\/+/, '')}`;
+    let u;
+    try { u = new URL(s); } catch (_) { return null; }
+    if (!/(^|\.)linkedin\.com$/i.test(u.hostname)) return null;
+    const path = u.pathname.replace(/\/{2,}/g, '/');
+    const inMatch = path.match(/^\/in\/([^/]+)/i);
+    if (inMatch) return `https://www.linkedin.com/in/${inMatch[1]}/`;
+    if (/^\/pub\/[^/]+/i.test(path)) return `https://www.linkedin.com${path}`;
+    if (/^\/sales\/(lead|people)\//i.test(path)) return `https://www.linkedin.com${path}${u.search}`;
+    return null;
+  }
+
+  function slugOf(url) {
+    try {
+      const path = decodeURIComponent(new URL(url, 'https://www.linkedin.com').pathname).toLowerCase();
+      const m = path.match(/\/(?:in|pub)\/([^/]+)/);
+      return m ? m[1] : null;
+    } catch (_) { return null; }
+  }
+
+  // "Task 2/324", "Task2/324", "Task 2 of 324"
+  function parseTaskLabel(text) {
+    const m = clean(text).match(/^task\s*(\d+)\s*(?:\/|of)\s*(\d+)$/i);
+    return m ? { n: +m[1], m: +m[2], text: `Task ${m[1]}/${m[2]}` } : null;
+  }
+
+  function limitKind(text) {
+    const t = clean(text).toLowerCase();
+    if (/(close to|approaching|nearing|almost (at|reached)) (the |your )?weekly (invitation |invite )?limit/.test(t)) return 'close';
+    if (/weekly (invitation |invite )?limit|invitation limit|out of invitations|no (more )?invitations left|too many pending invitations/.test(t)) return 'reached';
+    return null;
+  }
+
+  const noteQuotaHit = (text) =>
+    /personali[sz]ed (invitation|invite|note)s?/i.test(text) &&
+    /(used|out of|no more|left|remaining|this month|premium|unlimited)/i.test(text);
+
+  /* ============================ DOM HELPERS ============================= */
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
   const textOf = (el) => clean(el ? el.textContent : '');
-  const ariaOf = (el) => (el.getAttribute('aria-label') || '').toLowerCase();
+  const ariaOf = (el) => ((el && el.getAttribute && el.getAttribute('aria-label')) || '').toLowerCase();
   const ours = (el) => !!(el && el.closest && el.closest('#ptg-helper'));
   const autoOn = () => !!GM_getValue(KEY.auto, false);
+  const rectOf = (el) => el.getBoundingClientRect();
+  const isDisabled = (b) => !!b && (!!b.disabled || b.getAttribute('aria-disabled') === 'true');
+
+  // Visible text of an element, leaving out icon titles inside <svg>.
+  function ownText(el) {
+    if (!el) return '';
+    let s = '';
+    const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    let n;
+    while ((n = w.nextNode())) if (!(n.parentElement && n.parentElement.closest('svg'))) s += n.nodeValue;
+    return clean(s);
+  }
+
+  // Each text node on its own. HubSpot puts a label and its value in neighbouring boxes with no
+  // space between them, so joining textContent would glue "Email" onto the address.
+  function textPieces(el) {
+    const out = [];
+    if (!el) return out;
+    const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    let n;
+    while ((n = w.nextNode())) { const v = clean(n.nodeValue); if (v && !ours(n.parentElement)) out.push(v); }
+    return out;
+  }
+
+  // The button, link or menu item someone would actually click for `el`.
+  function actionable(el) {
+    const SEL = 'button, a[href], [role="button"], [role="menuitem"]';
+    if (el.matches && el.matches(SEL)) return el;
+    return (el.querySelector && [...el.querySelectorAll(SEL)].find(isVisible)) || el.closest(SEL) || el;
+  }
+
+  // Accessible hints on an icon button: aria-label, title, and the icon's own label or name.
+  function hintsOf(el) {
+    if (!el || !el.getAttribute) return '';
+    const parts = [el.getAttribute('aria-label'), el.getAttribute('title')];
+    for (const x of el.querySelectorAll('svg, title, [aria-label], [data-icon-name], [data-test-icon]')) {
+      if (x.tagName.toLowerCase() === 'title') parts.push(x.textContent);
+      parts.push(x.getAttribute('aria-label'), x.getAttribute('data-icon-name'), x.getAttribute('data-test-icon'));
+    }
+    return clean(parts.filter(Boolean).join(' ')).toLowerCase();
+  }
 
   function isVisible(el) {
     if (!el || !el.isConnected || !el.getClientRects().length) return false;
     return el.checkVisibility ? el.checkVisibility({ checkVisibilityCSS: true, visibilityProperty: true }) : true;
   }
 
-  async function waitFor(fn, timeout = 10000, every = 250) {
-    const end = Date.now() + timeout;
-    while (Date.now() < end) {
-      try { const v = fn(); if (v) return v; } catch (_) { /* keep waiting */ }
-      await sleep(every);
-    }
-    return null;
-  }
-
-  function slugOf(url) {
-    try {
-      const path = decodeURIComponent(new URL(url, location.href).pathname).toLowerCase();
-      const m = path.match(/\/(?:in|pub)\/([^/]+)/);
-      return m ? m[1] : null;
-    } catch (_) { return null; }
-  }
-
   // Elements whose own text node passes `test(rawText)`.
   function textNodes(root, test) {
     const out = [];
+    if (!root) return out;
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode: (n) => (test(n.nodeValue || '') ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP),
     });
@@ -85,11 +176,101 @@
     return out;
   }
 
+  // Resolves with fn()'s first truthy value. Re-checks on page changes as well as on a timer,
+  // so it stays quick even when Chrome slows down timers in a background tab.
+  function waitFor(fn, timeout = 10000, every = 250) {
+    return new Promise((resolve) => {
+      let done = false;
+      let pending = null;
+      let last = 0;
+      let poll = null;
+      let timer = null;
+      const observer = new MutationObserver(() => {
+        if (done || pending) return;
+        pending = setTimeout(() => { pending = null; check(); }, Math.max(0, 80 - (Date.now() - last)));
+      });
+      const finish = (v) => {
+        if (done) return;
+        done = true;
+        observer.disconnect();
+        clearInterval(poll);
+        clearTimeout(timer);
+        clearTimeout(pending);
+        resolve(v);
+      };
+      function check() {
+        if (done) return;
+        last = Date.now();
+        let v = null;
+        try { v = fn(); } catch (_) { v = null; }
+        if (v) finish(v);
+      }
+      observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, characterData: true });
+      poll = setInterval(check, every);
+      timer = setTimeout(() => { check(); finish(null); }, timeout);
+      check();
+    });
+  }
+
+  // Press-and-release without the final click. Some menus open on pointer-down only.
+  function pointerSeq(el) {
+    const r = rectOf(el);
+    const o = { bubbles: true, cancelable: true, composed: true, button: 0, buttons: 1, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+    try { el.dispatchEvent(new PointerEvent('pointerdown', { ...o, pointerType: 'mouse', isPrimary: true })); } catch (_) { /* ignore */ }
+    el.dispatchEvent(new MouseEvent('mousedown', o));
+    try { el.dispatchEvent(new PointerEvent('pointerup', { ...o, buttons: 0, pointerType: 'mouse', isPrimary: true })); } catch (_) { /* ignore */ }
+    el.dispatchEvent(new MouseEvent('mouseup', { ...o, buttons: 0 }));
+  }
+
+  function pressKey(el, key) {
+    const o = { key, code: key, bubbles: true, cancelable: true, composed: true };
+    el.dispatchEvent(new KeyboardEvent('keydown', o));
+    el.dispatchEvent(new KeyboardEvent('keyup', o));
+  }
+
+  // Try a plain click first; if nothing happens, a pointer press, then the keyboard.
+  // Each step only runs if the one before it changed nothing, so nothing gets clicked twice.
+  async function activate(el, done, firstWait = 1200, laterWait = firstWait) {
+    el.click();
+    let v = await waitFor(done, firstWait);
+    if (v || !el.isConnected) return v;
+    pointerSeq(el);
+    v = await waitFor(done, laterWait);
+    if (v || !el.isConnected) return v;
+    try { el.focus(); pressKey(el, 'Enter'); } catch (_) { /* ignore */ }
+    return waitFor(done, laterWait);
+  }
+
+  // Types into React-controlled inputs so the page notices the change.
+  function fillText(box, value) {
+    box.focus();
+    try { box.select(); } catch (_) { /* some input types can't select */ }
+    let ok = false;
+    try { ok = document.execCommand('insertText', false, value); } catch (_) { /* fall through */ }
+    if (!ok || box.value !== value) {
+      const proto = box instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+      Object.getOwnPropertyDescriptor(proto, 'value').set.call(box, value);
+      box.dispatchEvent(new Event('input', { bubbles: true }));
+      box.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  }
+
+  function hotkeys(map) {
+    document.addEventListener('keydown', (e) => {
+      if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      const act = map[e.code];
+      if (!act) return;
+      e.preventDefault();
+      e.stopPropagation();
+      act();
+    }, true);
+  }
+
   /* =============================== PANEL =============================== */
 
   // Solder-mask green with copper accents, so it never blends into HubSpot or LinkedIn.
   const CSS = `
-#ptg-helper{all:initial;position:fixed;bottom:18px;z-index:2147483647;width:276px;box-sizing:border-box;
+#ptg-helper{all:initial;position:fixed;bottom:18px;z-index:2147483647;width:280px;box-sizing:border-box;
   background:#0F3A2C;color:#E9F1EA;border:1px solid #1E5A45;border-radius:8px;
   box-shadow:0 10px 30px rgba(4,20,14,.45);font:12.5px/1.45 "Segoe UI",system-ui,-apple-system,sans-serif}
 #ptg-helper *{box-sizing:border-box;font:inherit;color:inherit;letter-spacing:normal;text-transform:none}
@@ -103,9 +284,12 @@
 #ptg-helper.ptg-collapsed .ptg-body{display:none}
 #ptg-helper .ptg-status{display:flex;align-items:center;gap:8px;font-weight:600;font-size:13.5px}
 #ptg-helper .ptg-dot{width:9px;height:9px;border-radius:50%;flex:none;background:#8FA89A}
-#ptg-helper .ptg-status[data-tone=ok] .ptg-dot{background:#5FD38D}
-#ptg-helper .ptg-status[data-tone=warn] .ptg-dot{background:#E8B04A}
-#ptg-helper .ptg-status[data-tone=err] .ptg-dot{background:#E5604D}
+#ptg-helper [data-tone=ok]>.ptg-dot,#ptg-helper [data-tone=work]>.ptg-dot{background:#5FD38D}
+#ptg-helper [data-tone=work]>.ptg-dot{animation:ptg-pulse 1.1s ease-in-out infinite}
+#ptg-helper [data-tone=warn]>.ptg-dot{background:#E8B04A}
+#ptg-helper [data-tone=err]>.ptg-dot{background:#E5604D}
+@keyframes ptg-pulse{50%{opacity:.3}}
+@media (prefers-reduced-motion:reduce){#ptg-helper .ptg-dot{animation:none!important}}
 #ptg-helper .ptg-sub{margin-top:4px;min-height:1.45em;color:#B7CDBF;overflow-wrap:anywhere}
 #ptg-helper .ptg-auto{display:flex;align-items:center;gap:8px;margin:10px 0 8px;cursor:pointer;user-select:none}
 #ptg-helper .ptg-auto input{appearance:auto;-webkit-appearance:checkbox;position:static;opacity:1;width:15px;height:15px;margin:0;accent-color:#D9A066}
@@ -117,10 +301,14 @@
 #ptg-helper button:focus-visible{outline:2px solid #D9A066;outline-offset:2px}
 #ptg-helper .ptg-keys{display:grid;grid-template-columns:auto 1fr;gap:4px 8px;margin-top:10px;font-size:11.5px;color:#B7CDBF}
 #ptg-helper kbd{font-weight:600;color:#E9F1EA;background:#174A39;border:1px solid #2A6B53;border-radius:4px;padding:0 5px;white-space:nowrap}
+#ptg-helper .ptg-mirror{display:none;align-items:baseline;gap:7px;margin-top:10px;padding-top:8px;border-top:1px solid #1E5A45;font-size:11.5px;color:#B7CDBF}
+#ptg-helper .ptg-mirror.ptg-on{display:flex}
+#ptg-helper .ptg-mirror .ptg-dot{width:7px;height:7px;transform:translateY(-1px)}
 `;
 
   function makePanel(side) {
     const style = document.createElement('style');
+    style.id = 'ptg-helper-style';
     style.textContent = CSS;
     (document.head || document.documentElement).appendChild(style);
 
@@ -128,13 +316,14 @@
     box.id = 'ptg-helper';
     box.className = side === 'left' ? 'ptg-left' : 'ptg-right';
     box.innerHTML = `
-      <div class="ptg-head"><span class="ptg-title">PTG connect helper</span><button type="button" class="ptg-min" title="Minimize">–</button></div>
+      <div class="ptg-head"><span class="ptg-title" title="Version ${VERSION}">PTG connect helper</span><button type="button" class="ptg-min" title="Minimize">–</button></div>
       <div class="ptg-body">
-        <div class="ptg-status" data-tone="info"><span class="ptg-dot"></span><span class="ptg-msg">Starting…</span></div>
+        <div class="ptg-status" data-tone="work"><span class="ptg-dot"></span><span class="ptg-msg">Starting…</span></div>
         <div class="ptg-sub"></div>
         <label class="ptg-auto"><input type="checkbox"><span>Auto mode</span></label>
         <div class="ptg-btns"></div>
         <div class="ptg-keys"></div>
+        <div class="ptg-mirror" data-tone="ok"><span class="ptg-dot"></span><span class="ptg-mirror-msg"></span></div>
       </div>`;
     document.body.appendChild(box);
 
@@ -155,8 +344,18 @@
 
     return {
       el: box,
-      status(msg, tone = 'info') { $('.ptg-msg').textContent = msg; $('.ptg-status').dataset.tone = tone; },
-      sub(msg) { $('.ptg-sub').textContent = msg || ''; },
+      // tone: ok (green), work (green, pulsing), warn (amber), err (red)
+      set(tone, msg, next = '') {
+        $('.ptg-status').dataset.tone = tone;
+        $('.ptg-msg').textContent = msg;
+        $('.ptg-sub').textContent = next || '';
+      },
+      mirror(tone, msg) {
+        const m = $('.ptg-mirror');
+        m.classList.toggle('ptg-on', !!msg);
+        m.dataset.tone = tone || 'ok';
+        $('.ptg-mirror-msg').textContent = msg ? `HubSpot: ${msg}` : '';
+      },
       button(label, fn) {
         const b = document.createElement('button');
         b.type = 'button';
@@ -175,42 +374,27 @@
           k.append(kbd, span);
         }
       },
-      show(v) { box.style.display = v ? '' : 'none'; },
-      keepAttached() { if (!box.isConnected) document.body.appendChild(box); },
+      keepAttached() {
+        if (!style.isConnected) (document.head || document.documentElement).appendChild(style);
+        if (!box.isConnected) document.body.appendChild(box);
+      },
     };
-  }
-
-  function clickHard(el) {
-    const r = el.getBoundingClientRect();
-    const o = { bubbles: true, cancelable: true, button: 0, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
-    try { el.dispatchEvent(new PointerEvent('pointerdown', { ...o, pointerType: 'mouse' })); } catch (_) { /* ignore */ }
-    el.dispatchEvent(new MouseEvent('mousedown', o));
-    try { el.dispatchEvent(new PointerEvent('pointerup', { ...o, pointerType: 'mouse' })); } catch (_) { /* ignore */ }
-    el.dispatchEvent(new MouseEvent('mouseup', o));
-    el.click();
-  }
-
-  function hotkeys(map) {
-    document.addEventListener('keydown', (e) => {
-      if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
-      const act = map[e.code];
-      if (!act) return;
-      e.preventDefault();
-      e.stopPropagation();
-      act();
-    }, true);
   }
 
   /* ============================== HUBSPOT ============================== */
 
   function runHubSpot() {
-    if (!/^app/.test(location.hostname)) return; // only the HubSpot app, not help/marketing sites
-    console.info('[PTG connect helper] loaded on HubSpot');
+    if (!/^app/.test(location.hostname)) return; // only the HubSpot app, not help or marketing sites
+    console.info(`[PTG connect helper ${VERSION}] loaded on HubSpot`);
     const ui = makePanel('right');
+    const say = (tone, msg, next = '') => {
+      ui.set(tone, msg, next);
+      try { GM_setValue(KEY.hs, { tone, msg, next, at: Date.now() }); } catch (_) { /* ignore */ }
+    };
     ui.button('Open LinkedIn', () => sendJob(true));
-    ui.button('Complete & next', () => completeAndNext());
-    ui.button('Back', () => goBack());
-    ui.button('Skip', () => skipToNext());
+    ui.button('Complete & next', () => run(completeAndNext));
+    ui.button('Back', () => run(goBack));
+    ui.button('Skip', () => run(skipToNext));
     ui.keys([
       ['Alt+L', 'Open LinkedIn profile'],
       ['Alt+X', 'Complete & next'],
@@ -223,242 +407,441 @@
     let lastKey = '';
     let busy = false;
     let token = 0;
-    let wasInQueue = false;
-    let reviewing = false; // true after Back: Auto stays paused so you can check
+    let inQueue = false;
+    let reviewing = false; // true after Back: Auto stays off so you can check
+    let flag = ''; // 'nourl' | 'same'
 
-    const taskId = () => new URLSearchParams(location.search).get('taskId');
+    async function run(fn) {
+      if (busy) return false;
+      busy = true;
+      try { await fn(); return true; } finally { busy = false; }
+    }
+
+    /* ---------- reading the task ---------- */
 
     function findTaskLabel() {
-      const hits = textNodes(document.body, (raw) => raw.includes('/') && /\d\s*\/\s*\d/.test(raw));
+      const hits = textNodes(document.body, (raw) => /\d\s*(?:\/|of)\s*\d/i.test(raw));
       for (const start of hits) {
         let el = start;
-        for (let i = 0; i < 3 && el; i++, el = el.parentElement) {
+        for (let i = 0; i < 3 && el && el !== document.body; i++, el = el.parentElement) {
           const t = textOf(el);
-          if (t.length > 25) break;
-          if (/^Task\s*\d+\s*\/\s*\d+$/i.test(t)) return el;
+          if (t.length > 30) break;
+          if (parseTaskLabel(t) && isVisible(el)) return el;
         }
       }
       return null;
     }
-    const labelText = () => textOf(findTaskLabel()) || 'Task';
-    const taskKey = () => taskId() || `${location.pathname}#${(labelText().match(/\d+/) || [''])[0]}`;
+    function labelInfo() {
+      const el = findTaskLabel();
+      const p = el && parseTaskLabel(textOf(el));
+      return p ? { el, ...p } : null;
+    }
+    function taskId() {
+      for (const [k, v] of new URLSearchParams(location.search)) if (/task|engagement/i.test(k) && /^\d+$/.test(v)) return v;
+      return null;
+    }
+    const recordId = () => (location.pathname.split('/').filter((s) => /^\d+$/.test(s)).pop() || '');
+    const taskKey = () => `${taskId() || '-'}|${recordId() || '-'}|${(labelInfo() || {}).n || '-'}`;
 
+    function keyInfoRoot() {
+      for (const h of textNodes(document.body, (raw) => /^\s*key information\s*$/i.test(raw))) {
+        if (!isVisible(h)) continue;
+        let el = h;
+        for (let i = 0; i < 5 && el && el !== document.body; i++, el = el.parentElement) {
+          if (textOf(el).length > 60) return el;
+        }
+      }
+      return null;
+    }
+
+    const LI_LABEL = /^\s*linked\s*in(\s+(profile|personal))?(\s+(url|link|bio|page|profile))?\s*:?\s*$/i;
+    function urlFrom(el) {
+      for (const a of el.querySelectorAll('a[href]')) {
+        if (ours(a)) continue;
+        const u = normalizeLinkedInUrl(a.href);
+        if (u) return u;
+      }
+      for (const t of textPieces(el)) {
+        const m = t.match(/(?:https?:\/\/)?(?:[\w-]+\.)?linkedin\.com\/(?:in|pub)\/[^\s"'<>]+/i);
+        const u = m && normalizeLinkedInUrl(m[0]);
+        if (u) return u;
+      }
+      return null;
+    }
     function findLinkedInUrl() {
-      const labels = textNodes(document.body, (raw) => /linkedin/i.test(raw) && /^\s*linkedin( profile)? url\s*$/i.test(raw));
-      for (const lab of labels) {
-        let el = lab;
-        for (let i = 0; i < 6 && el; i++, el = el.parentElement) {
-          const a = [...el.querySelectorAll('a[href]')].find((x) => LI_PROFILE_RE.test(x.href));
-          if (a) return a.href;
-          const m = textOf(el).match(/https?:\/\/[\w.]*linkedin\.com\/(?:in|pub)\/[^\s"'<>]+/i);
-          if (m) return m[0];
+      const info = keyInfoRoot();
+      for (const root of [info, document.body]) {
+        if (!root) continue;
+        for (const lab of textNodes(root, (raw) => LI_LABEL.test(raw))) {
+          if (!isVisible(lab)) continue;
+          let el = lab;
+          for (let i = 0; i < 5 && el && el !== document.body; i++, el = el.parentElement) {
+            const u = urlFrom(el);
+            if (u) return u;
+          }
         }
       }
-      const a = [...document.querySelectorAll('a[href*="linkedin.com"]')].find((x) => LI_PROFILE_RE.test(x.href) && !ours(x));
-      return a ? a.href : null;
+      if (info) { const u = urlFrom(info); if (u) return u; }
+      for (const a of document.querySelectorAll('a[href*="linkedin.com"]')) {
+        if (ours(a) || !isVisible(a)) continue;
+        const u = normalizeLinkedInUrl(a.href);
+        if (u) return u;
+      }
+      return null;
     }
 
-    // The prospect's email from the contact card (LinkedIn asks for THEIR email, not ours).
-    const EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
-    const isOwnEmail = (e) => /@ptg-electronics\.com$/i.test(e);
+    // The PROSPECT's email from the contact card. Your own @ptg-electronics.com address is never used.
     function findContactEmail() {
-      const labels = textNodes(document.body, (raw) => /^\s*email\s*$/i.test(raw));
-      for (const lab of labels) {
-        let el = lab;
-        for (let i = 0; i < 4 && el; i++, el = el.parentElement) {
-          const found = (textOf(el).match(EMAIL_RE) || []).find((e) => !isOwnEmail(e));
-          if (found) return found;
+      const info = keyInfoRoot();
+      const pick = (text) => (clean(text).match(EMAIL_RE) || []).find((e) => !isOwnEmail(e)) || null;
+      const pickIn = (el) => textPieces(el).map(pick).find(Boolean) || null;
+      for (const root of [info, document.body]) {
+        if (!root) continue;
+        for (const lab of textNodes(root, (raw) => /^\s*(e-?mail|email address)\s*:?\s*$/i.test(raw))) {
+          let el = lab;
+          for (let i = 0; i < 4 && el && el !== document.body; i++, el = el.parentElement) {
+            const found = pickIn(el);
+            if (found) return found;
+          }
         }
       }
-      const mail = [...document.querySelectorAll('a[href^="mailto:"]')]
-        .map((a) => decodeURIComponent(a.getAttribute('href').slice(7).split('?')[0]))
-        .find((e) => /@/.test(e) && !isOwnEmail(e));
-      return mail || null;
+      const exact = textNodes(document.body, (raw) => /^\s*[^\s@]+@[^\s@]+\.[a-z]{2,}\s*$/i.test(raw))
+        .filter(isVisible)
+        .map((el) => pick(el.textContent))
+        .find(Boolean);
+      if (exact) return exact;
+      for (const a of document.querySelectorAll('a[href^="mailto:"]')) {
+        const e = pick(decodeURIComponent(a.getAttribute('href').slice(7).split('?')[0]));
+        if (e) return e;
+      }
+      return null;
     }
 
-    const findComplete = () =>
-      [...document.querySelectorAll('button, [role="button"]')].find(
-        (b) => /^complete$/i.test(textOf(b)) && !b.disabled && !ours(b) && isVisible(b)
-      );
-    const isCompleted = () =>
-      textNodes(document.body, (raw) => /completed/i.test(raw) && /^\s*completed\s*$/i.test(raw)).some(isVisible);
-    const isDisabled = (b) => !!b.disabled || b.getAttribute('aria-disabled') === 'true';
+    /* ---------- Complete and the ‹ › arrows ---------- */
 
-    // The ‹ › arrows sit right after "Task N/M". Found by position, so icon-only buttons work.
+    const COMPLETE_RE = /^(mark (as )?)?complete( task)?$/i;
+    const DONE_RE = /^(completed|task completed|mark (as )?(incomplete|not complete(d)?)|reopen( task)?|undo complete)$/i;
+    const visibleButtons = () => [...document.querySelectorAll('button, [role="button"]')].filter((b) => !ours(b) && isVisible(b));
+    const matches = (b, re) => re.test(ownText(b)) || re.test(b.getAttribute('aria-label') || '') || re.test(b.getAttribute('title') || '');
+
+    function completeButton() {
+      return visibleButtons().filter((b) => matches(b, COMPLETE_RE)).sort((a, z) => rectOf(a).top - rectOf(z).top)[0] || null;
+    }
+    function completeButtonNear(where) {
+      return visibleButtons().some((b) => {
+        if (!matches(b, COMPLETE_RE)) return false;
+        const r = rectOf(b);
+        return Math.abs(r.top - where.top) < 40 && Math.abs(r.left - where.left) < 120;
+      });
+    }
+    // A "Completed" / "Reopen" state right where the Complete button was (never the timeline further down).
+    function doneIndicator(where) {
+      if (!where) {
+        const lab = findTaskLabel();
+        if (!lab) return null;
+        where = rectOf(lab);
+      }
+      const close = (r) => Math.abs(r.top - where.top) < 120 && Math.abs(r.left - where.left) < 500;
+      const btn = visibleButtons().find((b) => matches(b, DONE_RE) && close(rectOf(b)));
+      if (btn) return btn;
+      return textNodes(document.body, (raw) => /^\s*(completed|task completed)\s*$/i.test(raw))
+        .find((el) => isVisible(el) && close(rectOf(el))) || null;
+    }
+    const toastDone = () =>
+      [...document.querySelectorAll('[role="alert"], [role="status"]')]
+        .some((t) => !ours(t) && isVisible(t) && /task.{0,40}(complete|done)|marked as complete/i.test(textOf(t)));
+
+    const PREV_RE = /prev|previous|back|left|earlier/i;
+    const NEXT_RE = /next|forward|right|later/i;
+    const NOT_ARROW = /close|dismiss|exit|setting|more|option|edit|filter|complete|skip|menu|search|help|expand|collapse|minimi|maximi|copy|call|mail|note/i;
+
+    // The ‹ › arrows next to "Task N/M" are icon-only, so they're found by position (either side of the
+    // label), helped by their aria-label or icon name when HubSpot provides one.
     function navArrows() {
-      const lab = findTaskLabel();
-      if (!lab) return null;
-      const r = lab.getBoundingClientRect();
+      const info = labelInfo();
+      if (!info) return null;
+      const r = rectOf(info.el);
       const midY = r.top + r.height / 2;
-      const row = [...document.querySelectorAll('button, [role="button"]')]
-        .filter((b) => !ours(b) && isVisible(b))
-        .map((b) => ({ b, r: b.getBoundingClientRect() }))
-        .filter((x) => x.r.left >= r.right - 4 && x.r.left - r.right < 200 && x.r.top <= midY && x.r.bottom >= midY && x.r.width <= 64)
-        .sort((a, z) => a.r.left - z.r.left)
-        .map((x) => x.b);
-      const named = (re) => row.find((b) => re.test(`${ariaOf(b)} ${b.getAttribute('title') || ''}`));
-      const prev = named(/prev|back/i) || row[0] || null;
-      const next = named(/next|forward/i) || row[1] || null;
-      return prev || next ? { prev, next } : null;
+      const nameOf = (b) => `${hintsOf(b)} ${ownText(b)}`;
+      const near = visibleButtons()
+        .map((b) => ({ b, r: rectOf(b) }))
+        .filter(({ b, r: br }) => {
+          if (!br.width || br.width > 64 || br.height > 64) return false;
+          if (br.top > midY + 6 || br.bottom < midY - 6) return false;
+          const gap = br.left >= r.right - 4 ? br.left - r.right : r.left - br.right;
+          if (gap > 160) return false;
+          const own = ownText(b);
+          if (own.length > 1) return false;
+          const name = nameOf(b);
+          return !(NOT_ARROW.test(name) && !PREV_RE.test(name) && !NEXT_RE.test(name));
+        });
+      const isPrev = (x) => PREV_RE.test(nameOf(x.b)) || /^[‹<←]$/.test(ownText(x.b));
+      const isNext = (x) => NEXT_RE.test(nameOf(x.b)) || /^[›>→]$/.test(ownText(x.b));
+      let prev = near.find((x) => isPrev(x) && !isNext(x)) || null;
+      let next = near.find((x) => isNext(x) && !isPrev(x)) || null;
+      if (!prev || !next) {
+        const rest = near.filter((x) => x !== prev && x !== next);
+        const left = rest.filter((x) => x.r.right <= r.left + 4).sort((a, z) => z.r.right - a.r.right); // closest first
+        const right = rest.filter((x) => x.r.left >= r.right - 4).sort((a, z) => a.r.left - z.r.left); // closest first
+        const pair = (a, z) => z.r.left - a.r.right < 32;
+        if (!prev && !next) {
+          if (left.length && right.length) { prev = left[0]; next = right[0]; }
+          else if (right.length >= 2 && pair(right[0], right[1])) { prev = right[0]; next = right[1]; }
+          else if (left.length >= 2 && pair(left[1], left[0])) { prev = left[1]; next = left[0]; }
+          else if (rest.length === 1 && info.n === 1) next = rest[0];
+          else if (rest.length === 1 && info.n === info.m) prev = rest[0];
+        } else if (!next) {
+          next = right.find((x) => x.r.left >= prev.r.right - 4) || null;
+        } else {
+          prev = left.find((x) => x.r.right <= next.r.left + 4) || right.find((x) => x.r.right <= next.r.left + 4) || null;
+        }
+      }
+      if (prev && next && prev.b === next.b) return null;
+      return prev || next ? { prev: prev ? prev.b : null, next: next ? next.b : null } : null;
     }
 
     async function clickArrow(which, startKey) {
       const btn = await waitFor(() => {
         const a = navArrows();
-        return a && a[which] && !isDisabled(a[which]) ? a[which] : null;
-      }, which === 'next' ? 6000 : 3000);
+        const b = a && a[which];
+        return b && !isDisabled(b) ? b : null;
+      }, which === 'next' ? 5000 : 3000);
       if (!btn) return 'none';
-      clickHard(btn);
-      return (await waitFor(() => taskKey() !== startKey, 10000)) ? 'moved' : 'stuck';
+      const moved = await activate(btn, () => taskKey() !== startKey, 4000, 6000);
+      return moved ? 'moved' : 'stuck';
     }
+
+    /* ---------- the LinkedIn helper tab ---------- */
+
+    const pongWaiters = new Map();
+    GM_addValueChangeListener(KEY.pong, (_k, _o, v, remote) => {
+      if (!remote || !v || !pongWaiters.has(v.id)) return;
+      pongWaiters.get(v.id)(true);
+      pongWaiters.delete(v.id);
+    });
+    function ping(ms) {
+      const id = Math.random().toString(36).slice(2);
+      return new Promise((resolve) => {
+        const t = setTimeout(() => { pongWaiters.delete(id); resolve(false); }, ms);
+        pongWaiters.set(id, (v) => { clearTimeout(t); resolve(v); });
+        GM_setValue(KEY.ping, { id, at: Date.now() });
+      });
+    }
+    function beatFresh() {
+      const b = GM_getValue(KEY.beat, null);
+      const at = typeof b === 'number' ? b : b && b.at;
+      return !!at && Date.now() - at < 12000;
+    }
+    function openHelper(url) {
+      const target = `${(url || 'https://www.linkedin.com/feed/').split('#')[0]}#${WORKER_HASH}`;
+      let w = null;
+      try { w = window.open(target, WORKER_NAME); } catch (_) { /* blocked */ }
+      if (!w) { try { GM_openInTab(target, { active: true, setParent: true }); } catch (_) { /* ignore */ } }
+    }
+
+    async function sendJob(fromClick) {
+      const info = labelInfo();
+      if (!info) {
+        if (!fromClick) return;
+        if (beatFresh() || (await ping(700))) {
+          say('ok', 'LinkedIn helper tab is open', 'Start your task queue, then press Alt+L.');
+        } else {
+          openHelper(null);
+          say('ok', 'Opened the LinkedIn helper tab', 'Keep it open. Start your task queue, then press Alt+L.');
+        }
+        return;
+      }
+      if (!currentUrl) currentUrl = findLinkedInUrl();
+      if (!currentUrl) {
+        say('warn', `${info.text}: no LinkedIn URL`, 'Do this one by hand, then Alt+X (complete) or Alt+S (skip).');
+        return;
+      }
+      const email = findContactEmail();
+      const job = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        url: currentUrl,
+        slug: slugOf(currentUrl),
+        email,
+        key: taskKey(),
+        label: info.text,
+        at: Date.now(),
+      };
+      let alive = beatFresh() || (await ping(fromClick ? 700 : 1200));
+      GM_setValue(KEY.job, job);
+      if (!alive && fromClick) { openHelper(currentUrl); alive = true; }
+      if (!alive) {
+        say('warn', `${info.text}: LinkedIn helper tab isn’t open`, 'Click “Open LinkedIn” once to open it.');
+        return;
+      }
+      flag = '';
+      say('ok', `${info.text}: opened on LinkedIn`, email ? currentUrl : `${currentUrl} (no email in HubSpot)`);
+    }
+
+    /* ---------- moving through the queue ---------- */
+
+    const kick = () => setTimeout(tick, 60);
 
     async function onTaskChange() {
       const mine = ++token;
       if (currentUrl) prevUrl = currentUrl;
       currentUrl = null;
-      ui.status('Loading task…');
-      ui.sub('');
-      await sleep(800);
+      flag = '';
+      const label = (labelInfo() || {}).text || 'Task';
+      say('work', `${label}: loading…`, 'Reading the contact’s LinkedIn link.');
+      await sleep(700);
       let url = await waitFor(() => { const u = findLinkedInUrl(); return u && u !== prevUrl ? u : null; }, 6000);
       if (mine !== token) return;
-      if (!url) url = findLinkedInUrl();
+      let same = false;
+      if (!url) { url = findLinkedInUrl(); same = !!url && url === prevUrl; }
       currentUrl = url;
       if (!url) {
-        ui.status(`${labelText()}: no LinkedIn URL`, 'warn');
-        ui.sub('Handle this one by hand, then Complete & next or Skip.');
+        flag = 'nourl';
+        say('warn', `${label}: no LinkedIn URL`, 'Do this one by hand, then Alt+X (complete) or Alt+S (skip).');
         return;
       }
       if (reviewing) {
-        ui.status(`${labelText()}: checking`, 'warn');
-        ui.sub('Auto is paused. Alt+L to view them on LinkedIn. Turn Auto back on to continue.');
+        say('warn', `${label}: checking (Auto paused)`, 'Alt+L to view them on LinkedIn. Turn Auto back on to continue from here.');
         return;
       }
-      ui.status(`${labelText()}: ready`, 'ok');
-      ui.sub(url === prevUrl ? `Same LinkedIn as the last task, double-check: ${url}` : url);
+      if (same) {
+        flag = 'same';
+        say('warn', `${label}: same LinkedIn as the last task`, 'Make sure the contact loaded, then press Alt+L to open it.');
+        return;
+      }
+      say('ok', `${label}: ready`, autoOn() ? 'Opening on LinkedIn…' : 'Press Alt+L to open them on LinkedIn.');
       if (autoOn()) sendJob(false);
     }
 
-    function sendJob(fromClick) {
-      if (!currentUrl) currentUrl = findLinkedInUrl();
-      if (!currentUrl) { ui.status('This task has no LinkedIn URL', 'warn'); return; }
-      const workerAlive = Date.now() - GM_getValue(KEY.worker, 0) < 15000;
-      const useOpen = fromClick && !workerAlive;
-      GM_setValue(KEY.job, {
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        url: currentUrl,
-        slug: slugOf(currentUrl),
-        email: findContactEmail(),
-        taskId: taskId(),
-        at: Date.now(),
-        opened: useOpen,
-      });
-      if (useOpen) window.open(`${currentUrl.split('#')[0]}#${WORKER_HASH}`, WORKER_NAME);
-      ui.status(`${labelText()}: opened on LinkedIn`, 'info');
-      ui.sub(workerAlive || useOpen ? currentUrl : 'LinkedIn helper tab not found. Click “Open LinkedIn” once.');
-    }
-
     async function goNext(startKey) {
-      ui.status('Going to next task…');
+      const info = labelInfo();
+      say('work', 'Going to the next task…', '');
       const res = await clickArrow('next', startKey);
-      if (res === 'moved') return;
-      if (res === 'none') {
-        const m = labelText().match(/(\d+)\s*\/\s*(\d+)/);
-        if (m && m[1] === m[2]) {
-          GM_setValue(KEY.auto, false);
-          ui.status('End of the queue 🎉', 'ok');
-          ui.sub('Auto mode is off.');
-        } else {
-          ui.status('Couldn’t find the › arrow, click it yourself', 'err');
-        }
+      if (res === 'moved') { kick(); return; }
+      if (res === 'none' && info && info.n === info.m) {
+        GM_setValue(KEY.auto, false);
+        say('ok', 'End of the queue', 'Every task is done. Auto mode is off.');
         return;
       }
-      ui.status('Next task didn’t load, check HubSpot', 'err');
+      if (res === 'none') {
+        say('err', 'Couldn’t find the › arrow', `Click › next to “${info ? info.text : 'Task N/M'}” yourself.`);
+        return;
+      }
+      say('err', 'The next task didn’t load', 'Check HubSpot. When the next task is open, press Alt+L.');
     }
 
     async function goBack() {
-      if (busy) return;
-      busy = true;
-      try {
-        if (autoOn()) GM_setValue(KEY.auto, false);
-        reviewing = true;
-        ui.status('Going back…');
-        const res = await clickArrow('prev', taskKey());
-        if (res === 'none') ui.status('No previous task to go back to', 'warn');
-        else if (res === 'stuck') ui.status('Previous task didn’t load, check HubSpot', 'err');
-      } finally {
-        busy = false;
-      }
-    }
-
-    async function completeAndNext() {
-      if (busy) return;
-      busy = true;
-      try {
-        const startKey = taskKey();
-        if (!isCompleted()) {
-          const btn = findComplete();
-          if (!btn) { ui.status('Complete button not found, click it yourself', 'err'); return; }
-          btn.click();
-          ui.status('Completing…');
-          const ok = await waitFor(() => taskKey() !== startKey || isCompleted(), 8000);
-          if (!ok) { ui.status('Couldn’t confirm Complete, check HubSpot', 'err'); return; }
-          if (taskKey() !== startKey) return; // HubSpot moved on by itself
-          await sleep(500);
-        }
-        await goNext(startKey);
-      } finally {
-        busy = false;
-      }
+      if (autoOn()) GM_setValue(KEY.auto, false);
+      reviewing = true;
+      say('work', 'Going back…', 'Auto mode is paused so you can check.');
+      const res = await clickArrow('prev', taskKey());
+      if (res === 'moved') { kick(); return; }
+      if (res === 'none') say('warn', 'No previous task', 'This is the first task. Turn Auto on to continue from here.');
+      else say('err', 'The previous task didn’t load', 'Check HubSpot, then press Alt+L to open the task on LinkedIn.');
     }
 
     async function skipToNext() {
-      if (busy) return;
-      busy = true;
-      try { await goNext(taskKey()); } finally { busy = false; }
+      say('work', 'Skipping…', 'Moving on without completing this task.');
+      await goNext(taskKey());
     }
 
-    // Results coming back from the LinkedIn tab.
-    GM_addValueChangeListener(KEY.result, (_k, _o, res, remote) => {
+    async function completeAndNext() {
+      const startKey = taskKey();
+      const label = (labelInfo() || {}).text || 'Task';
+      say('work', `${label}: completing…`, 'Clicking Complete in HubSpot.');
+      const btn = await waitFor(() => { const b = completeButton(); return b && !isDisabled(b) ? b : null; }, 3000);
+      if (!btn) {
+        if (!doneIndicator()) {
+          const grey = completeButton();
+          say('err', grey ? 'Complete is greyed out' : 'Complete button not found', 'Click Complete in HubSpot yourself, then Alt+S to move on.');
+          return;
+        }
+        // Already completed: just move on.
+      } else {
+        const where = rectOf(btn);
+        const t0 = Date.now();
+        let disabledSince = 0;
+        btn.click();
+        const ok = await waitFor(() => {
+          if (taskKey() !== startKey || doneIndicator(where) || toastDone()) return true;
+          if (btn.isConnected && isVisible(btn) && !matches(btn, COMPLETE_RE)) return true; // label changed
+          if (isDisabled(btn)) { disabledSince = disabledSince || Date.now(); if (Date.now() - disabledSince > 1500) return true; } else disabledSince = 0;
+          return Date.now() - t0 > 800 && !completeButtonNear(where); // the button went away
+        }, 8000);
+        if (!ok) {
+          say('err', 'HubSpot didn’t confirm Complete', 'Check the task, then Alt+X to try again or Alt+S to move on.');
+          return;
+        }
+        if (taskKey() !== startKey) { kick(); return; } // HubSpot moved on by itself
+        await sleep(600);
+      }
+      await goNext(startKey);
+    }
+
+    /* ---------- results from the LinkedIn tab ---------- */
+
+    GM_addValueChangeListener(KEY.result, async (_k, _o, res, remote) => {
       if (!remote || !res) return;
       const job = GM_getValue(KEY.job, null);
-      if (!job || res.jobId !== job.id || job.taskId !== taskId()) return; // stale or for another task
-      if (res.status === 'stop') { ui.status('LinkedIn invite limit reached', 'err'); ui.sub('Auto mode is off.'); return; }
-      if (res.status === 'skip') skipToNext();
-      else if (res.status === 'back') goBack();
-      else completeAndNext();
-    });
-
-    hotkeys({
-      KeyL: () => { if (wasInQueue) sendJob(true); },
-      KeyX: () => { if (wasInQueue) completeAndNext(); },
-      KeyS: () => { if (wasInQueue) skipToNext(); },
-      KeyB: () => { if (wasInQueue) goBack(); },
+      if (!job || res.jobId !== job.id) return; // an older task
+      if (res.status === 'stop') {
+        say('err', 'LinkedIn invite limit reached', 'Auto mode is off. Stop sending until LinkedIn resets your limit.');
+        return;
+      }
+      if (res.auto && (!autoOn() || reviewing)) {
+        say('warn', `${job.label || 'Task'}: not completed`, 'Auto mode is off. Press Alt+X if it should be completed.');
+        return;
+      }
+      if (busy) await waitFor(() => !busy, 15000);
+      if (res.status === 'back') { run(goBack); return; }
+      if (job.key !== taskKey()) {
+        say('warn', 'HubSpot is on a different task now', `LinkedIn’s answer was for ${job.label || 'another task'}. Check it, then Alt+X or Alt+S.`);
+        return;
+      }
+      if (res.status === 'skip') run(skipToNext);
+      else run(completeAndNext);
     });
 
     // Turning Auto on (in either panel) ends review and sends the current task to LinkedIn.
     GM_addValueChangeListener(KEY.auto, (_k, _o, on) => {
       if (!on) return;
+      const wasReviewing = reviewing;
       reviewing = false;
-      if (wasInQueue && !busy && currentUrl) sendJob(false);
+      if (!inQueue || busy || !currentUrl || (flag === 'same' && !wasReviewing)) return;
+      const label = (labelInfo() || {}).text || 'Task';
+      say('ok', `${label}: ready`, 'Opening on LinkedIn…');
+      sendJob(false);
     });
 
-    setInterval(() => {
+    hotkeys({
+      KeyL: () => sendJob(true),
+      KeyX: () => { if (inQueue) run(completeAndNext); },
+      KeyS: () => { if (inQueue) run(skipToNext); },
+      KeyB: () => { if (inQueue) run(goBack); },
+    });
+
+    function tick() {
       ui.keepAttached();
-      const inQueue = !!findTaskLabel() || !!taskId();
-      wasInQueue = inQueue;
+      inQueue = !!findTaskLabel() || !!taskId();
       if (!inQueue) {
-        // Panel stays visible so you can tell the script is running.
+        // The panel stays visible on every HubSpot page so you can tell the script is running.
         if (lastKey !== 'idle') {
           lastKey = 'idle';
           currentUrl = null;
-          ui.status('Waiting for the task queue');
-          ui.sub('Go to Tasks and click “Start tasks”.');
+          prevUrl = null;
+          say('ok', 'Waiting for the task queue', 'Go to Tasks and click “Start tasks”.');
         }
         return;
       }
       const key = taskKey();
-      if (key && key !== lastKey) { lastKey = key; onTaskChange(); }
-    }, 1000);
+      if (key !== lastKey) { lastKey = key; onTaskChange(); }
+    }
+
+    let tickTimer = null;
+    new MutationObserver(() => {
+      if (!tickTimer) tickTimer = setTimeout(() => { tickTimer = null; tick(); }, 400);
+    }).observe(document.body, { childList: true, subtree: true, characterData: true });
+    setInterval(tick, 1000);
+    tick();
   }
 
   /* ============================== LINKEDIN ============================= */
@@ -475,6 +858,7 @@
       return window.name === WORKER_NAME;
     };
     if (!isWorker()) return; // only the helper tab gets the panel
+    console.info(`[PTG connect helper ${VERSION}] loaded on LinkedIn (helper tab)`);
 
     const LABEL = {
       sent: 'Invite sent',
@@ -483,7 +867,6 @@
       done: 'Marked done',
       skip: 'Skipped',
       back: 'Going back',
-      stop: 'Stopped',
     };
 
     const ui = makePanel('left');
@@ -504,333 +887,508 @@
     let autoTimer = null;
     let current = null;
     let person = '';
-    let warnNote = '';
+    let redirected = false;
     let preparing = false;
+    let retired = false;
+    let limitSeen = '';
 
-    const beat = () => { GM_setValue(KEY.worker, Date.now()); ui.keepAttached(); };
+    const say = (tone, msg, next = '') => { if (!retired) ui.set(tone, msg, next); };
+
+    // The newest helper tab wins; any older one steps aside.
+    GM_setValue(KEY.claim, { id: TAB_ID, at: Date.now() });
+    GM_addValueChangeListener(KEY.claim, (_k, _o, v, remote) => { if (remote && v && v.id !== TAB_ID) retire(); });
+    function retire() {
+      if (retired) return;
+      ui.set('warn', 'Another LinkedIn tab took over', 'You can close this tab.');
+      retired = true;
+      job = null;
+      clearTimeout(autoTimer);
+      try { sessionStorage.removeItem('ptg_worker'); } catch (_) { /* ignore */ }
+      if (window.name === WORKER_NAME) window.name = '';
+    }
+
+    const beat = () => { if (!retired) { GM_setValue(KEY.beat, { id: TAB_ID, at: Date.now() }); ui.keepAttached(); } };
     beat();
     setInterval(beat, 5000);
+    GM_addValueChangeListener(KEY.ping, (_k, _o, v, remote) => {
+      if (remote && v && !retired) GM_setValue(KEY.pong, { id: v.id, at: Date.now() });
+    });
 
-    /* ---------- reading the profile ---------- */
+    // Show HubSpot's status here too, since this is the tab you're looking at.
+    const showHs = (v) => { if (v && Date.now() - v.at < 30 * 60 * 1000) ui.mirror(v.tone, v.msg); };
+    showHs(GM_getValue(KEY.hs, null));
+    GM_addValueChangeListener(KEY.hs, (_k, _o, v) => showHs(v));
+
+    /* ---------- page state ---------- */
+
+    const onProfilePath = () => /^\/(in|pub)\//i.test(location.pathname);
+    const blockedPage = () => /^\/(checkpoint|authwall|uas\/login|login|signup)/i.test(location.pathname);
+    const pageMissing = () =>
+      textNodes(document.querySelector('main') || document.body, (raw) =>
+        /this page doesn.?t exist|page not found|profile (is )?(not available|unavailable)/i.test(raw)
+      ).some(isVisible);
+
+    function handleBlocked() {
+      if (autoOn()) GM_setValue(KEY.auto, false);
+      say('err', 'LinkedIn wants you to sign in or verify', 'Do that in this tab. Auto mode is off; turn it back on after.');
+    }
+
+    function noticeText() {
+      return [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], [role="alert"], [role="status"], [aria-live]')]
+        .filter((d) => !ours(d) && isVisible(d))
+        .map(textOf)
+        .join(' ');
+    }
+
+    // LinkedIn's weekly limit warning stops everything and turns Auto off.
+    function checkLimits() {
+      if (retired) return false;
+      const kind = limitKind(noticeText());
+      if (!kind) return false;
+      if (autoOn()) GM_setValue(KEY.auto, false);
+      clearTimeout(autoTimer);
+      if (kind === 'reached') {
+        if (limitSeen !== 'reached' && job) {
+          GM_setValue(KEY.result, { jobId: job.id, key: job.key, status: 'stop', at: Date.now() });
+          reported = true;
+        }
+        limitSeen = 'reached';
+        say('err', 'LinkedIn invite limit reached', 'Auto mode is off. Stop sending until LinkedIn resets your limit.');
+        return true;
+      }
+      if (limitSeen === 'close') return false;
+      limitSeen = 'close';
+      say('warn', 'Close to LinkedIn’s weekly limit', 'Auto mode is off. Send by hand if you want, or stop for this week.');
+      return true;
+    }
+    setInterval(() => { if (job && !retired) checkLimits(); }, 2000);
+
+    /* ---------- reading the profile (top card only) ---------- */
+
+    const SIDEBAR_HEAD = /^(more profiles for you|people you may know|people also viewed|other similar profiles|people similar to .+|you might like|explore premium profiles|pages for you|get expert advice on .+)$/i;
+
+    // True for anything in the right-hand "More profiles for you" style boxes.
+    function inSidebar(el, nameEl) {
+      if (!el || !el.closest) return false;
+      if (el.closest('aside, [role="complementary"]')) return true;
+      for (let a = el.parentElement, i = 0; a && a !== document.body && i < 10; a = a.parentElement, i++) {
+        if (nameEl && a.contains(nameEl)) return false;
+        const h = a.querySelector('h2, h3');
+        if (h && SIDEBAR_HEAD.test(textOf(h))) return true;
+      }
+      return false;
+    }
 
     function nameFromPage() {
       const title = clean(document.title.replace(/^\(\d+\+?\)\s*/, '')).split(' | ')[0].trim();
       const root = document.querySelector('main') || document.body;
       if (title && !/^linkedin$/i.test(title)) {
-        const first = title.split(' ')[0];
-        const el = textNodes(root, (raw) => raw.includes(first) && clean(raw) === title).find(isVisible);
+        const el = textNodes(root, (raw) => clean(raw) === title).find((e) => isVisible(e) && !inSidebar(e));
         if (el) return { name: title, el };
       }
-      const h1 = [...root.querySelectorAll('h1')].find((h) => isVisible(h) && h.offsetHeight > 12 && textOf(h));
+      const h1 = [...root.querySelectorAll('h1')].find((h) => isVisible(h) && !ours(h) && !inSidebar(h) && textOf(h) && textOf(h).length < 90);
       return h1 ? { name: textOf(h1), el: h1 } : null;
     }
 
-    // Smallest block around the name that also holds the action buttons (Message / Connect / More).
-    function topCard(nameEl) {
-      const isAction = (b) =>
-        /^(message|connect|follow|following|pending|more)$/i.test(textOf(b)) || /more actions|to connect|pending/.test(ariaOf(b));
-      for (let el = nameEl, i = 0; el && el !== document.body && i < 15; el = el.parentElement, i++) {
-        if ([...el.querySelectorAll('button, a, [role="button"]')].some((b) => isAction(b) && isVisible(b))) return el;
-      }
-      return nameEl.closest('section') || document.querySelector('main') || document.body;
-    }
+    const ACTION_TEXT = /^(message|connect|follow|following|pending|more|save in sales navigator|view in sales navigator)$/i;
+    const isAction = (b) => ACTION_TEXT.test(ownText(b)) || /more actions|to connect|^pending|^message|^follow/.test(ariaOf(b));
 
-    const candidates = (scope) =>
-      [...scope.querySelectorAll('button, a, [role="button"], [role="menuitem"], li, span')].filter(
-        (e) => !ours(e) && (e.hasAttribute('aria-label') || (e.textContent || '').length <= 40) && isVisible(e)
-      );
+    // Smallest block around the name that also holds the action buttons (Message / Connect / … ).
+    // Gives up rather than reaching the sidebar.
+    function topCard(nameEl) {
+      for (let el = nameEl.parentElement, i = 0; el && el !== document.body && i < 15; el = el.parentElement, i++) {
+        if (el.querySelector('aside, [role="complementary"]')) return null;
+        if ([...el.querySelectorAll('h2, h3')].some((h) => SIDEBAR_HEAD.test(textOf(h)))) return null;
+        if ([...el.querySelectorAll('button, a, [role="button"]')].some((b) => !ours(b) && isAction(b) && isVisible(b))) return el;
+      }
+      return null;
+    }
 
     const hasFirstDegree = (card) =>
       textNodes(card, (raw) => raw.includes('1st') && /^[·•]?\s*1st$|1st degree connection/i.test(clean(raw))).length > 0;
 
-    // strict = only trust elements that name this person (used when scanning the whole page).
+    const RELEVANT = /connect|invite|pending|withdraw|remove/i;
+    function candidates(scope, nameEl) {
+      return [...scope.querySelectorAll('button, a, [role="button"], [role="menuitem"], li, span, div[aria-label]')].filter((e) => {
+        if (ours(e)) return false;
+        const a = e.getAttribute('aria-label') || '';
+        const t = e.textContent || '';
+        if (!(RELEVANT.test(a) || (t.length <= 40 && RELEVANT.test(t)))) return false;
+        return isVisible(e) && !inSidebar(e, nameEl);
+      });
+    }
+
+    // strict = only trust elements that name this exact person (used for whole-page scans).
     function classify(els, ctx, strict) {
-      let connect = null;
+      let byAria = null;
+      let byHref = null;
+      let byText = null;
+      const namesThem = (s) => !!ctx.full && normName(s).includes(ctx.full);
       for (const e of els) {
         const aria = ariaOf(e);
-        const t = textOf(e).toLowerCase();
+        const t = ownText(e).toLowerCase();
         const href = (e.getAttribute('href') || '').toLowerCase();
-        const namesThem = !!ctx.first && aria.includes(ctx.first);
-        if ((!strict && t === 'remove connection') || (/remove (your )?connection/.test(aria) && (namesThem || !strict))) {
+        if ((!strict && t === 'remove connection') || (/remove (your )?connection/.test(aria) && (!strict || namesThem(aria)))) {
           return { kind: 'connected' };
         }
-        if ((!strict && t === 'pending') || (/^pending|withdraw invitation/.test(aria) && (namesThem || !strict))) {
+        if ((!strict && t === 'pending') || ((/^pending\b/.test(aria) || /withdraw (the )?invitation/.test(aria)) && (!strict || namesThem(aria)))) {
           return { kind: 'pending' };
         }
-        if (connect) continue;
         const invite = aria.match(/invite (.+?) to connect/);
-        if (invite) { if (!ctx.first || invite[1].includes(ctx.first)) connect = e; continue; }
-        if (href.includes('custom-invite')) { if (!strict || !ctx.slug || href.includes(ctx.slug)) connect = e; continue; }
-        if (!strict && t === 'connect') connect = e;
+        if (invite) { if (!byAria && (!strict || namesThem(invite[1]))) byAria = e; continue; }
+        if (href.includes('custom-invite')) { if (!byHref && (!strict || (ctx.slug && href.includes(ctx.slug)))) byHref = e; continue; }
+        if (!byText && !strict && t === 'connect') byText = e;
       }
-      if (!connect) return null;
-      return { kind: 'connect', el: connect.closest('button, a, [role="button"], [role="menuitem"]') || connect };
+      const connect = byAria || byHref || byText;
+      return connect ? { kind: 'connect', el: actionable(connect) } : null;
     }
 
-    function findMoreButton(card) {
-      const btns = [...card.querySelectorAll('button, [role="button"]')].filter((b) => !ours(b) && isVisible(b));
-      return (
-        btns.find((b) => /^more( actions)?$/.test(ariaOf(b)) || /^more$/i.test(textOf(b))) ||
-        btns.find((b) => /more actions/.test(ariaOf(b))) ||
-        null
-      );
+    // The … button. Usually labeled "More actions"; if not, it's the icon-only button in the
+    // same row as Message / Follow / Save in Sales Navigator.
+    function findMoreButton(card, nameEl) {
+      const btns = [...card.querySelectorAll('button, [role="button"]')].filter((b) => !ours(b) && isVisible(b) && !inSidebar(b, nameEl));
+      const hint = (b) => clean(`${hintsOf(b)} ${ownText(b).toLowerCase()}`);
+      const seeMore = /(see|show|load|read) more/;
+      const named =
+        btns.find((b) => /(^|\s)more (actions|options)(\s|$)|overflow/.test(hint(b)) && !seeMore.test(hint(b))) ||
+        btns.find((b) => /^more$/.test(hint(b))) ||
+        btns.find((b) => /^(…|\.\.\.|⋯|•••)$/.test(ownText(b)));
+      if (named) return named;
+      const rows = btns.filter(isAction).map(rectOf);
+      if (!rows.length) return null;
+      const icons = btns
+        .filter((b) => !isAction(b) && ownText(b).length <= 1 && !/notif|bell|close|dismiss|edit|camera|photo|cover/.test(hintsOf(b)))
+        .map((b) => ({ b, r: rectOf(b) }))
+        .filter(({ r }) => rows.some((a) => Math.abs((a.top + a.bottom) / 2 - (r.top + r.bottom) / 2) < 10 && r.left >= a.left))
+        .sort((x, y) => y.r.left - x.r.left);
+      return icons.length ? icons[0].b : null;
     }
 
-    function openMenu(more) {
+    // Menu items sit just below (or above) the … button, never in the sidebar column.
+    function nearMore(e, more) {
+      const r = rectOf(e);
+      const m = rectOf(more);
+      const cx = r.left + r.width / 2;
+      const cy = r.top + r.height / 2;
+      return cx >= m.left - 320 && cx <= m.right + 320 && cy >= m.top - 450 && cy <= m.bottom + 550;
+    }
+
+    function menuRoot(more) {
       const id = more.getAttribute('aria-controls');
       const byId = id && document.getElementById(id);
-      if (byId && isVisible(byId)) return byId;
-      return [...document.querySelectorAll('[role="menu"], .artdeco-dropdown__content--is-open')]
-        .filter((m) => isVisible(m) && !ours(m))
+      if (byId && isVisible(byId) && !ours(byId)) return byId;
+      return [...document.querySelectorAll('[role="menu"], [role="listbox"]')]
+        .filter((m) => !ours(m) && isVisible(m) && nearMore(m, more))
         .pop() || null;
     }
 
-    function closeMenu(more) {
-      if (more.getAttribute('aria-expanded') === 'true' || openMenu(more)) more.click();
+    const MENUISH = /^(connect|follow|unfollow|remove connection|withdraw( invitation)?|pending|save to pdf|about this member|about this profile|send profile in a message|view in sales navigator|request a recommendation|recommend .{1,40}|report .{1,60}|block .{1,60}|share profile.*|copy link to profile|never an employee of my org)$/i;
+    function menuish(more, nameEl) {
+      return [...document.querySelectorAll('button, a, [role="button"], [role="menuitem"], [role="option"], li')].filter((e) => {
+        if (ours(e) || (e.textContent || '').length > 70) return false;
+        const a = e.getAttribute('aria-label') || '';
+        if (!(MENUISH.test(ownText(e)) || /invite .+ to connect|remove (your )?connection|withdraw/i.test(a))) return false;
+        return isVisible(e) && nearMore(e, more) && !inSidebar(e, nameEl);
+      });
     }
 
+    async function openMore(more, before, nameEl) {
+      const isOpen = () =>
+        more.getAttribute('aria-expanded') === 'true' || !!menuRoot(more) || menuish(more, nameEl).some((e) => !before.has(e));
+      if (isOpen()) return true;
+      return !!(await activate(more, isOpen, 900));
+    }
+
+    function closeMore(more) {
+      if (!more) return;
+      try { pressKey(document.activeElement || document.body, 'Escape'); } catch (_) { /* ignore */ }
+      setTimeout(() => { if (more.isConnected && more.getAttribute('aria-expanded') === 'true') more.click(); }, 250);
+    }
+
+    // connected / pending / connect (top card first, then the … menu) / unknown
     async function detectStatus(who) {
       const card = topCard(who.el);
-      const ctx = { first: who.name.split(' ')[0].toLowerCase(), slug: slugOf(location.href) };
+      if (!card) return { kind: 'unknown', reason: 'card' };
+      const ctx = { full: normName(who.name), slug: slugOf(location.href) };
       if (hasFirstDegree(card)) return { kind: 'connected' };
-      let st = classify(candidates(card), ctx, false);
+      let st = classify(candidates(card, who.el), ctx, false);
       if (st) return st;
-      const more = findMoreButton(card);
-      if (!more) return classify(candidates(document.body), ctx, true) || { kind: 'unknown' };
-      more.click();
+
+      const more = findMoreButton(card, who.el);
+      if (!more) return classify(candidates(document.body, who.el), ctx, true) || { kind: 'unknown', reason: 'nomore' };
+
+      const before = new Set(menuish(more, who.el)); // anything already on screen isn't part of the menu
+      if (!(await openMore(more, before, who.el))) return { kind: 'unknown', reason: 'menu' };
       st = await waitFor(() => {
-        const menu = openMenu(more);
-        return (
-          (menu && classify(candidates(menu), ctx, false)) ||
-          classify(candidates(card), ctx, false) ||
-          classify(candidates(document.body), ctx, true)
-        );
+        const root = menuRoot(more);
+        const fresh = menuish(more, who.el).filter((e) => !before.has(e));
+        return (root && classify(candidates(root, who.el), ctx, false)) || classify(fresh, ctx, false) || classify(candidates(card, who.el), ctx, false);
       }, 3000);
-      if (!st || st.kind !== 'connect') closeMenu(more);
-      return st || { kind: 'unknown' };
+      if (st && st.kind === 'connect') return { ...st, more };
+      closeMore(more);
+      return st || { kind: 'unknown', reason: 'nomenuconnect' };
     }
 
-    /* ---------- invite dialog ---------- */
-
-    const dialogs = () =>
-      [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], .artdeco-modal')].filter((d) => !ours(d) && isVisible(d));
-    const inviteDialog = () =>
-      dialogs().filter((d) => /invit|add a note|personali[sz]e|connect/i.test(textOf(d))).pop() || null;
-
-    function limitHit() {
-      const t = dialogs().map(textOf).join(' ');
-      if (!/weekly invitation limit|invitation limit|reached the weekly limit|too many pending invitations/i.test(t)) return false;
-      GM_setValue(KEY.auto, false);
-      report('stop', true);
-      ui.status('LinkedIn invite limit reached', 'err');
-      ui.sub('Auto mode is off. Stop sending until the limit resets.');
-      return true;
-    }
-
-    function fillText(box, value) {
-      box.focus();
-      try { box.select(); } catch (_) { /* some input types can't select */ }
-      let ok = false;
-      try { ok = document.execCommand('insertText', false, value); } catch (_) { /* fall through */ }
-      if (!ok || box.value !== value) {
-        const proto = box instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
-        const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
-        setter.call(box, value);
-        box.dispatchEvent(new Event('input', { bubbles: true }));
-        box.dispatchEvent(new Event('change', { bubbles: true }));
+    function explainStatus(st) {
+      if (st.kind === 'connected' || st.kind === 'pending') {
+        say('ok', LABEL[st.kind], `${person}. Press Alt+X to complete in HubSpot.`);
+        return;
       }
+      const who = person || 'This person';
+      const text = {
+        card: ['Couldn’t find the profile’s buttons', 'Reload this tab (F5), or handle it by hand, then Alt+X or Alt+S.'],
+        nomore: ['No Connect button or … menu', `${who}. Handle it by hand, then Alt+X (done) or Alt+S (skip).`],
+        menu: ['The … menu didn’t open', 'Click … yourself, then press Alt+C.'],
+        nomenuconnect: ['No Connect under the … menu', `${who} may only allow Follow. Handle it by hand, then Alt+X or Alt+S.`],
+      }[st.reason] || ['No Connect option found', `${who}. Handle it by hand, then Alt+X (done) or Alt+S (skip).`];
+      say('warn', text[0], text[1]);
     }
+
+    /* ---------- invite window ---------- */
+
+    const INVITE_TEXT = /add a note|invitation|invite|personali[sz]e|verify this member knows you|send without a note/i;
+    const EMAIL_ASK = /enter (their|his|her|the member.?s) email|verify (that )?this member knows you/i;
+    const dialogs = () => [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter((d) => !ours(d) && isVisible(d));
+    const inviteDialog = () => dialogs().filter((d) => INVITE_TEXT.test(textOf(d))).pop() || null;
+    const quotaDialog = () => dialogs().find((d) => noteQuotaHit(textOf(d)) && !d.querySelector('textarea')) || null;
+    const dialogButton = (d, re) =>
+      d && [...d.querySelectorAll('button, [role="button"]')].find((b) => !ours(b) && isVisible(b) && (re.test(ownText(b)) || re.test(b.getAttribute('aria-label') || '')));
+    const sendButton = (d) => dialogButton(d, /^send( invitation| now)?$/i);
+    const textareaIn = (d) => (d ? [...d.querySelectorAll('textarea')].find(isVisible) || null : null);
+
+    function emailInput(d) {
+      if (!d) return null;
+      const ins = [...d.querySelectorAll('input')].filter((i) => isVisible(i) && !/^(hidden|checkbox|radio|submit|button|search|file)$/i.test(i.type || ''));
+      return (
+        ins.find((i) => (i.type || '').toLowerCase() === 'email') ||
+        ins.find((i) => /mail/i.test(`${i.name} ${i.id} ${i.getAttribute('aria-label') || ''} ${i.getAttribute('autocomplete') || ''} ${i.placeholder || ''}`)) ||
+        (ins.length === 1 && EMAIL_ASK.test(textOf(d)) ? ins[0] : null)
+      );
+    }
+    const needsEmail = (d) => !!d && (EMAIL_ASK.test(textOf(d)) || !!emailInput(d));
 
     async function prepareInvite() {
-      if (preparing) return;
+      if (preparing || retired) return;
       preparing = true;
       try {
-        let st = current;
-        if (!st || st.kind !== 'connect' || !isVisible(st.el)) {
-          const who = nameFromPage();
-          if (!who) { ui.status('Profile hasn’t loaded yet', 'warn'); return; }
-          person = who.name;
-          st = await detectStatus(who);
-          current = st;
-        }
-        if (st.kind !== 'connect') {
-          ui.status(st.kind === 'unknown' ? 'No Connect button found' : LABEL[st.kind], 'warn');
-          return;
-        }
-
-        try { GM_setClipboard(MESSAGE, 'text'); } catch (_) { /* ignore */ }
-        st.el.click();
-
-        const dlg = await waitFor(inviteDialog, 6000);
+        if (checkLimits()) return;
+        let dlg = inviteDialog();
         if (!dlg) {
-          ui.status('Invite window didn’t open', 'warn');
-          ui.sub('Click Connect yourself. The note is on your clipboard (Ctrl+V).');
-          return;
-        }
-        if (limitHit()) return;
+          let st = current;
+          if (!st || st.kind !== 'connect' || !isVisible(st.el)) {
+            const who = nameFromPage();
+            if (!who || !topCard(who.el)) { say('warn', 'The profile hasn’t loaded yet', 'Wait a moment, then press Alt+C again.'); return; }
+            person = who.name;
+            say('work', 'Looking for Connect…', `${person}: checking the buttons and the … menu.`);
+            st = await detectStatus(who);
+            current = st;
+          }
+          if (st.kind !== 'connect') { explainStatus(st); return; }
 
-        const emailSel = 'input[type="email"], input[name="email"]';
-        const wantsEmail = !!dlg.querySelector(emailSel);
-        const email = job && job.email;
-        if (wantsEmail && !email) {
-          ui.status('LinkedIn is asking for their email', 'warn');
-          ui.sub('This HubSpot contact has no email. Type it in, or press Alt+S to skip.');
-          return;
+          say('work', 'Opening the invite…', person);
+          const got = await activate(st.el, () => inviteDialog() || quotaDialog() || (limitKind(noticeText()) ? 'limit' : null), 1500);
+          if (checkLimits()) return;
+          if (!got || got === 'limit') {
+            try { GM_setClipboard(MESSAGE, 'text'); } catch (_) { /* ignore */ }
+            say('warn', 'The invite window didn’t open', 'Click Connect yourself (it may be under …). The note is on your clipboard.');
+            return;
+          }
+          dlg = inviteDialog() || got;
         }
 
-        // Open the note box first (it can re-draw the dialog), then fill email and note.
-        let box = dlg.querySelector('textarea');
+        // 1) Email, when LinkedIn asks for it. This is the PROSPECT's email from HubSpot, never yours.
+        const email = job && job.email && !isOwnEmail(job.email) ? job.email : '';
+        if (needsEmail(dlg)) {
+          const inp = emailInput(dlg);
+          if (!email) {
+            if (inp) inp.focus();
+            say('warn', 'LinkedIn needs their email', `HubSpot has no email for ${person || 'this contact'}. Type their email (not yours), or Alt+S to skip.`);
+            return;
+          }
+          if (inp) fillText(inp, email);
+        }
+
+        // 2) The note box.
+        let box = textareaIn(dlg);
+        let quota = false;
         if (!box) {
-          const add = [...dlg.querySelectorAll('button')].find((b) => /add a (free )?note/i.test(`${ariaOf(b)} ${textOf(b)}`));
+          const add = dialogButton(dlg, /^add a (free )?note$/i);
           if (add) {
+            await sleep(150);
             add.click();
-            box = await waitFor(() => { const d = inviteDialog(); return d && d.querySelector('textarea'); }, 5000);
+            const got = await waitFor(() => textareaIn(inviteDialog()) || (quotaDialog() ? 'quota' : null), 5000);
+            if (got === 'quota') quota = true;
+            else box = got;
           }
         }
-        if (limitHit()) return;
-
-        let filledEmail = '';
-        if (wantsEmail) {
-          const emailBox = (inviteDialog() || dlg).querySelector(emailSel);
-          if (emailBox) { fillText(emailBox, email); filledEmail = email; }
-        }
-        if (box) fillText(box, MESSAGE);
-        if (!box && !filledEmail) {
-          ui.status('Note box isn’t available', 'warn');
-          ui.sub('Send without a note, or press Alt+S to skip. The note is on your clipboard.');
+        if (checkLimits()) return;
+        if (!box) {
+          try { GM_setClipboard(MESSAGE, 'text'); } catch (_) { /* ignore */ }
+          if (quota || noteQuotaHit(noticeText())) {
+            say('warn', 'No free notes left this month', 'LinkedIn won’t add a note right now. Send without a note, or Alt+S to skip.');
+          } else {
+            say('warn', 'The note box didn’t open', 'Click “Add a note” and paste with Ctrl+V, or Alt+S to skip.');
+          }
           return;
         }
 
-        await sleep(300);
-        const d = inviteDialog();
-        const send = d && [...d.querySelectorAll('button')].find(
-          (b) => /^send( invitation| now)?$/i.test(textOf(b)) || /^send (invitation|now)$/.test(ariaOf(b))
-        );
-        const what = box && filledEmail ? 'Email and note ready' : box ? 'Note ready' : 'Email ready';
-        if (send && !send.disabled) {
-          send.focus();
-          ui.status(`${what}, press Enter to send`, 'ok');
-        } else {
-          ui.status(`${what}, click Send`, 'ok');
+        // The window can redraw when the note box opens, so check the email again.
+        const d2 = inviteDialog() || dlg;
+        if (email && needsEmail(d2)) {
+          const inp = emailInput(d2);
+          if (inp && clean(inp.value).toLowerCase() !== email.toLowerCase()) fillText(inp, email);
         }
-        ui.sub(`Check it’s ${person}${filledEmail ? ` (${filledEmail})` : ''}${warnNote}.`);
+        fillText(box, MESSAGE);
+        await sleep(250);
+
+        const d3 = inviteDialog() || d2;
+        if (clean(box.value) !== clean(MESSAGE)) {
+          try { GM_setClipboard(MESSAGE, 'text'); } catch (_) { /* ignore */ }
+          if (!box.value) say('warn', 'Couldn’t type the note', 'Click in the note box and paste with Ctrl+V.');
+          else say('warn', 'The note didn’t fit', `LinkedIn kept ${box.value.length} characters. Fix it here, or shorten MESSAGE in the script.`);
+          return;
+        }
+        const filledEmail = email && needsEmail(d3) ? email : '';
+        const check = `Check it’s ${person || 'the right person'}${filledEmail ? ` (${filledEmail})` : ''}${redirected ? '. The link redirected' : ''}.`;
+        const send = sendButton(d3);
+        if (send && !isDisabled(send)) {
+          send.focus();
+          say('ok', 'Ready: press Enter to send', check);
+        } else {
+          say('warn', 'Send is greyed out', `${check} Fix what LinkedIn points out, then click Send.`);
+        }
       } finally {
         preparing = false;
       }
     }
 
-    // Your own click (or Enter) on Send is what triggers Complete in HubSpot.
+    // Your own click (or Enter) on Send is what completes the task in HubSpot.
     document.addEventListener('click', (e) => {
-      if (!job || reported) return;
-      const b = e.target instanceof Element ? e.target.closest('button') : null;
-      if (!b || ours(b)) return;
-      const d = b.closest('[role="dialog"], .artdeco-modal');
-      if (!d || !/invit|add a note|personali[sz]e|connect/i.test(textOf(d))) return;
-      if (!/\bsend\b/i.test(`${ariaOf(b)} ${textOf(b)}`)) return;
+      if (retired || !job || reported) return;
+      const b = e.target instanceof Element ? e.target.closest('button, [role="button"]') : null;
+      if (!b || ours(b) || isDisabled(b)) return;
+      const d = b.closest('[role="dialog"], [role="alertdialog"]');
+      if (!d || !INVITE_TEXT.test(textOf(d))) return;
+      if (!/\bsend\b/.test(`${ariaOf(b)} ${ownText(b).toLowerCase()}`)) return;
       afterSend(d);
     }, true);
 
     async function afterSend(d) {
-      ui.status('Sending…');
-      await waitFor(() => !isVisible(d), 6000);
+      say('work', 'Sending…', '');
+      const closed = await waitFor(() => !d.isConnected || !isVisible(d), 8000);
       await sleep(700);
-      if (limitHit()) return;
+      if (checkLimits()) return;
+      if (!closed) {
+        say('warn', 'The invite window is still open', 'Read LinkedIn’s message. If it sent, press Alt+X; if not, fix it or Alt+S.');
+        return;
+      }
+      if (/couldn.?t send|wasn.?t sent|something went wrong|try again|incorrect email|valid email|doesn.?t match/i.test(noticeText())) {
+        say('err', 'LinkedIn didn’t send the invite', 'Read LinkedIn’s message, then try again or Alt+S to skip.');
+        return;
+      }
       report('sent');
     }
 
     /* ---------- talking to HubSpot ---------- */
 
-    function report(status, force) {
+    function report(status, force, auto) {
+      if (retired) return;
       if (!job) {
-        ui.status('No HubSpot task yet', 'warn');
-        ui.sub('Press Alt+L in the HubSpot task queue first.');
+        say('warn', 'No HubSpot task yet', 'Start your task queue and press Alt+L there.');
         return;
       }
       if (reported && !force) return;
       reported = true;
       clearTimeout(autoTimer);
-      GM_setValue(KEY.result, { jobId: job.id, status, at: Date.now() });
-      if (status === 'stop') return;
+      autoTimer = null;
+      GM_setValue(KEY.result, { jobId: job.id, key: job.key, status, auto: !!auto, at: Date.now() });
       if (status === 'back') {
-        ui.status('Going back in HubSpot', 'warn');
-        ui.sub('Auto is paused. Press Alt+L in HubSpot to view that task here.');
+        say('warn', 'Going back in HubSpot', 'Auto is paused. Press Alt+L in HubSpot to open that task here.');
         return;
       }
-      ui.status(LABEL[status], 'ok');
-      ui.sub(autoOn() ? 'Updating HubSpot. The next profile will load here.' : 'Updating HubSpot. Press Alt+L there for the next one.');
+      say('ok', LABEL[status], autoOn() ? 'Updating HubSpot. The next profile will load here.' : 'Updating HubSpot. Press Alt+L there for the next one.');
     }
 
-    async function start(j, mismatch) {
+    async function start(j, isRedirect) {
       job = j;
       reported = false;
       current = null;
+      person = '';
+      redirected = !!isRedirect;
+      limitSeen = '';
       clearTimeout(autoTimer);
-      warnNote = mismatch ? ' (the link redirected, double-check)' : '';
+      autoTimer = null;
+      const tag = j.label ? `${j.label}: ` : '';
 
-      if (!/^\/(in|pub)\//.test(location.pathname)) {
-        ui.status('This isn’t a regular profile page', 'warn');
-        ui.sub('Handle it by hand, then Alt+X (done) or Alt+S (skip).');
+      if (blockedPage()) { handleBlocked(); return; }
+      if (!onProfilePath()) {
+        say('warn', `${tag}not a regular profile page`, 'Handle it by hand, then Alt+X (done) or Alt+S (skip).');
         return;
       }
-      ui.status('Reading profile…');
-      ui.sub('');
-      const who = await waitFor(nameFromPage, 15000);
+      if (inviteDialog()) { say('ok', 'The invite window is open', 'Check it, then press Enter to send.'); return; }
+
+      say('work', `${tag}reading the profile…`, '');
+      const found = await waitFor(() => {
+        if (pageMissing()) return { missing: true };
+        const who = nameFromPage();
+        return who && topCard(who.el) ? { who } : null;
+      }, 15000);
       if (job !== j) return;
-      if (!who) {
-        ui.status('Profile didn’t finish loading', 'err');
-        ui.sub('Handle it by hand, then Alt+X (done) or Alt+S (skip).');
-        return;
-      }
-      person = who.name;
-      ui.sub(person + warnNote);
-      await sleep(900); // let the buttons render
+      if (!found) { say('err', 'The profile didn’t finish loading', 'Reload this tab (F5), or handle it by hand, then Alt+X or Alt+S.'); return; }
+      if (found.missing) { say('warn', 'This LinkedIn link is broken', 'Fix the URL in HubSpot. For now, Alt+S to skip.'); return; }
+      person = found.who.name;
+      if (checkLimits()) return;
+      await sleep(500); // let the rest of the buttons render
 
-      const st = await detectStatus(who);
+      const st = await detectStatus(nameFromPage() || found.who);
       if (job !== j) return;
       current = st;
 
       if (st.kind === 'connected' || st.kind === 'pending') {
-        ui.status(LABEL[st.kind], 'ok');
-        if (autoOn() && !mismatch) {
-          ui.sub(`${person}, completing in HubSpot…`);
-          autoTimer = setTimeout(() => report(st.kind), AUTO_COMPLETE_DELAY_MS);
+        if (redirected) {
+          say('warn', `${LABEL[st.kind]}, but the link redirected`, `Check this is the right person (${person}), then Alt+X to complete.`);
+        } else if (autoOn()) {
+          say('ok', LABEL[st.kind], `${person}. Completing in HubSpot…`);
+          autoTimer = setTimeout(() => { if (job === j && autoOn()) report(st.kind, false, true); }, AUTO_COMPLETE_DELAY_MS);
         } else {
-          ui.sub(`${person}. Press Alt+X to complete in HubSpot.`);
+          say('ok', LABEL[st.kind], `${person}. Press Alt+X to complete in HubSpot.`);
         }
         return;
       }
       if (st.kind === 'connect') {
-        ui.status('Not connected yet');
-        ui.sub(`${person}${warnNote}. Press Alt+C to connect.`);
-        if (autoOn()) prepareInvite();
+        if (redirected) {
+          closeMore(st.more);
+          say('warn', 'The link redirected to another profile', `Check this is the right person (${person}), then Alt+C to connect.`);
+        } else if (autoOn()) {
+          prepareInvite();
+        } else {
+          closeMore(st.more);
+          say('ok', 'Not connected yet', `${person}. Press Alt+C to connect with the note.`);
+        }
         return;
       }
-      ui.status('No Connect button found', 'warn');
-      ui.sub(`${person}. Handle it by hand, then Alt+X (done) or Alt+S (skip).`);
+      explainStatus(st);
     }
 
     GM_addValueChangeListener(KEY.job, (_k, _o, nj, remote) => {
-      if (!remote || !nj) return;
-      if (nj.opened) {
-        // HubSpot opened a fresh helper tab. If it wasn't this one, step aside.
-        setTimeout(() => {
-          try { sessionStorage.removeItem('ptg_worker'); } catch (_) { /* ignore */ }
-          window.name = '';
-          job = null;
-          ui.status('Another LinkedIn tab took over', 'warn');
-          ui.sub('You can close this tab.');
-        }, 4000);
-        return;
-      }
+      if (!remote || !nj || retired) return;
       setTimeout(() => {
-        if (nj.slug && slugOf(location.href) === nj.slug) {
+        if (retired) return;
+        if (nj.slug && slugOf(location.href) === nj.slug && onProfilePath()) {
           start(nj, false);
         } else {
-          ui.status('Opening next profile…');
-          ui.sub('');
+          job = nj;
+          say('work', `${nj.label ? `${nj.label}: ` : ''}opening the profile…`, '');
           location.href = nj.url;
         }
-      }, 300);
+      }, 250);
+    });
+
+    GM_addValueChangeListener(KEY.auto, (_k, _o, on) => {
+      if (on || retired || !autoTimer) return;
+      clearTimeout(autoTimer);
+      autoTimer = null;
+      if (current && LABEL[current.kind]) say('ok', LABEL[current.kind], `${person}. Auto is off, so press Alt+X to complete in HubSpot.`);
     });
 
     hotkeys({
@@ -841,15 +1399,16 @@
     });
 
     // On page load, pick up the task HubSpot sent.
-    const saved = GM_getValue(KEY.job, null);
-    const here = slugOf(location.href);
-    const fresh = saved && Date.now() - saved.at < 60000;
-    if (saved && saved.slug && here === saved.slug) start(saved, false);
-    else if (fresh && /^\/(in|pub)\//.test(location.pathname)) start(saved, !!saved.slug);
-    else if (fresh && !saved.slug) start(saved, false);
-    else {
-      ui.status('Waiting for HubSpot');
-      ui.sub('Start your task queue and press Alt+L there.');
+    if (blockedPage()) {
+      handleBlocked();
+    } else {
+      const saved = GM_getValue(KEY.job, null);
+      const here = slugOf(location.href);
+      const fresh = saved && Date.now() - saved.at < 90000;
+      if (saved && saved.slug && here === saved.slug) start(saved, false);
+      else if (fresh && onProfilePath()) start(saved, true); // the link landed on a different profile
+      else if (fresh && !saved.slug) start(saved, false);
+      else say('ok', 'Waiting for HubSpot', 'Start your task queue in HubSpot and press Alt+L there.');
     }
   }
 
