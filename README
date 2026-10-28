@@ -1,95 +1,156 @@
 # PTG Connect Helper
 
-A Tampermonkey userscript that speeds up LinkedIn connection outreach from the HubSpot task queue. For each task, it reads the contact's LinkedIn URL and opens the profile. It then prepares a connection request with a personalized note. Once the invite is sent, it marks the HubSpot task complete and moves on to the next one.
+A Tampermonkey userscript for Chrome that connects HubSpot's task queue to LinkedIn, so a LinkedIn connection task takes one keypress instead of a dozen clicks. A person still checks and sends every invite: the script prepares the invite and leaves the final **Send** to you.
 
-Built by **Eightrhio Camus** (Business Development, PTG Electronics) with AI assistance from **Claude by Anthropic**.
+Built for business development outreach at PTG Electronics.
 
-## Why I built it
+## What it does
 
-The manual routine for every task looked like this:
+Without the script, each LinkedIn task in the HubSpot queue means: open the contact's LinkedIn link, find Connect (sometimes hidden under the **…** menu), click "Add a note", paste the note, type the prospect's email if LinkedIn asks for it, send, go back to HubSpot, click **Complete**, then click **›** to reach the next task.
 
-1. Start the task.
-2. Open the LinkedIn link.
-3. Send a connection request with a note.
-4. Go back to HubSpot.
-5. Click Complete.
-6. Click the next arrow.
+With the script, the loop looks like this:
 
-Across a queue of more than 300 tasks, that adds up to a lot of tab switching and repetitive clicking. This script cuts each task down to a single keypress while still keeping a person in charge of every invite that goes out.
+1. HubSpot reads the current task's LinkedIn URL and the contact's email from **Key information** and hands them to a dedicated LinkedIn helper tab.
+2. The helper tab loads the profile and checks the top card (never the "More profiles for you" sidebar).
+3. Already connected (1st degree) or invite already pending: HubSpot completes the task and moves on by itself.
+4. Not connected yet: the script clicks **Connect** (opening the **…** menu if that's where it is), clicks **Add a note**, fills in the note, fills in the prospect's email if LinkedIn asks for it, and puts the cursor on **Send**.
+5. You check the name, email and note, then press **Enter**.
+6. HubSpot clicks **Complete**, waits for it to register, and clicks **›** to open the next task. The next profile loads in the helper tab.
+
+## Install
+
+### 1. Install Tampermonkey
+
+Add [Tampermonkey](https://www.tampermonkey.net/) to Chrome from the Chrome Web Store.
+
+### 2. Allow user scripts
+
+Chrome blocks userscripts until you allow them for Tampermonkey.
+
+**Chrome 138 or newer:** right-click the Tampermonkey icon in the toolbar, choose **Manage extension**, and turn on **Allow User Scripts**.
+
+**Older Chrome:** go to `chrome://extensions` and turn on **Developer mode** (top right).
+
+On the same **Manage extension** page, check that **Site access** is **On all sites** (or at least includes hubspot.com and linkedin.com). Restart Chrome if scripts still don't run.
+
+### 3. Install the script
+
+Open `hubspot-connect-helper.user.js` in this repo and click **Raw**. Tampermonkey opens an install page; click **Install**.
+
+Or: Tampermonkey icon → **Dashboard** → **+** tab, paste the whole file, and press **Ctrl+S**.
+
+Updating from an older version: install over it (same name, so Tampermonkey offers **Update**), then make sure only one copy is enabled in the Dashboard.
+
+### 4. Reload
+
+Reload any open HubSpot and LinkedIn tabs.
+
+## Daily use
+
+1. In HubSpot, go to **Tasks** and click **Start tasks**. The panel at the bottom right shows `Task N/M: ready`.
+2. Click **Open LinkedIn** in the panel (or press **Alt+L**) once. This opens the LinkedIn helper tab. Keep it open for the whole session.
+3. Tick **Auto mode** in either panel (they share the setting).
+4. For each new person, check the invite the script prepared and press **Enter**.
+5. If the dot turns amber, the task needs you. If it turns red, something failed; the line under it says what to do.
+
+**Tip:** drag the LinkedIn helper tab into its own window and put the two windows side by side. You'll see both panels, and Chrome keeps both pages running at full speed (background tabs get slowed down).
+
+## Controls
+
+**Auto mode** loads each profile automatically, completes connected and pending contacts automatically, and prepares the note for new ones. It never presses Send.
+
+| Where | Key | Action |
+| --- | --- | --- |
+| HubSpot | Alt+L | Open the task's profile on LinkedIn (opens the helper tab the first time) |
+| HubSpot | Alt+X | Complete & next |
+| HubSpot | Alt+B | Back to the previous task (pauses Auto) |
+| HubSpot | Alt+S | Skip to the next task without completing |
+| LinkedIn | Alt+C | Connect with note |
+| LinkedIn | Enter | Send the prepared invite |
+| LinkedIn | Alt+X | Mark done (complete in HubSpot) |
+| LinkedIn | Alt+B | Back to the previous task |
+| LinkedIn | Alt+S | Skip |
+
+**Back is for double-checking.** It turns Auto off so the queue doesn't jump forward again while you look. Turning Auto back on resumes from the task you're on.
+
+## Status dot
+
+| Dot | Meaning |
+| --- | --- |
+| Green | Everything is fine. A pulsing green dot means it's working on something. |
+| Amber | Needs your attention: no LinkedIn URL, a link that redirected, no email for a contact LinkedIn wants an email for, and so on. |
+| Red | Something failed or LinkedIn stopped you. The line under it says what to do next. |
+
+The HubSpot panel stays visible on every HubSpot page so you can tell the script is running. The LinkedIn panel also shows HubSpot's latest status on its bottom line, since that's the tab you'll be looking at.
+
+## Safety rules built in
+
+- **You send every invite.** The script focuses the Send button and stops. Sending, and completing the task afterwards, only happens after your own click or Enter.
+- **Weekly invitation limit.** If LinkedIn says you've reached (or are close to) the weekly limit, Auto turns off and HubSpot is told to stop.
+- **Sign-in or verification pages** turn Auto off.
+- **The prospect's email, never yours.** When LinkedIn asks for an email to connect, it's asking for the *member's* email, so the script uses the contact's email from HubSpot. Addresses on your own domain are never filled in. If HubSpot has no email for the contact, the script stops and asks you.
+- **Flags instead of guesses.** Tasks with no LinkedIn URL, a URL that's the same as the previous task's, and profile links that redirect to a different profile are flagged amber and never completed automatically.
+- **Top card only.** Connect, Pending and 1st-degree checks only look at the profile's own card and its **…** menu, never the "More profiles for you" sidebar.
+- **Answers are matched to their task.** A result from LinkedIn is only acted on if HubSpot is still on the task it was sent for.
+
+## Settings
+
+Edit these at the top of the script (Tampermonkey Dashboard → the script → editor):
+
+| Setting | What it is |
+| --- | --- |
+| `MESSAGE` | The connection note. Free LinkedIn accounts allow 200 characters, Premium 300. |
+| `OWN_EMAIL_DOMAIN` | Your company's email domain, which is never typed into LinkedIn's email box. |
+| `AUTO_COMPLETE_DELAY_MS` | How long "Already connected / pending" stays on screen before HubSpot is completed. |
+
+Free LinkedIn accounts can only add a note to a few invites per month. When that runs out, the panel says so and you can send without a note or skip.
+
+## Troubleshooting
+
+**No panel at all.** Check that **Allow User Scripts** (or Developer mode) is on, the script is enabled in the Tampermonkey Dashboard, and the tab was reloaded.
+
+**No panel on LinkedIn.** The panel only appears in the helper tab. Open it from HubSpot (**Open LinkedIn** or **Alt+L**), or in any LinkedIn tab click the Tampermonkey icon and choose **Use this tab for PTG connect helper**.
+
+**"LinkedIn helper tab isn't open."** The helper tab was closed or Chrome put it to sleep. Click **Open LinkedIn** once.
+
+**"Another LinkedIn tab took over."** You opened a second helper tab. Close the older one.
+
+**"Couldn't find the › arrow" or "Complete button not found."** HubSpot changed its layout. Click it yourself and carry on, then report it so the script can be updated.
+
+**"The … menu didn't open."** Click **…** yourself and press **Alt+C**.
 
 ## How it works
 
-The script runs two small panels that pass information to each other through Tampermonkey's shared storage. One panel sits on the HubSpot task queue. The other sits on a dedicated LinkedIn tab.
+One script runs on `app*.hubspot.com` and `www.linkedin.com`. The two tabs talk through Tampermonkey's shared storage (`GM_setValue` and `GM_addValueChangeListener`): HubSpot posts a job (profile URL, prospect email, task), LinkedIn posts a result (sent, connected, pending, done, skip, back or stop), and HubSpot acts on it.
 
-| What the script finds on LinkedIn | What happens |
-|---|---|
-| Already connected | The HubSpot task is completed and the queue moves to the next task. |
-| Invitation already pending | Same as above. |
-| Not connected yet | The script clicks Connect and adds the note. If LinkedIn asks for the prospect's email, it fills that in from HubSpot. It then focuses the Send button. Once you press Enter, the task is completed and the queue moves on. |
-| No Connect option, or an unexpected page | The script pauses so you can handle the task by hand. |
+HubSpot and LinkedIn change their markup often, so the script finds things by visible text, ARIA labels and position rather than CSS class names. For example, HubSpot's **‹ ›** arrows are icon-only, so they're found by where they sit next to `Task N/M` (with or without a space, on either side of the label). LinkedIn's **…** menu items are found by what appears on screen after the menu opens, next to the **…** button.
 
-The final Send is always a human keypress, by design. It means someone checks that each invite is going to the right person. It also avoids fully automated invitations, which LinkedIn restricts.
+## Use responsibly
 
-## Features
+LinkedIn's User Agreement restricts automated activity. This script deliberately leaves every Send to a person and stops when LinkedIn warns about limits. Work at a human pace, and stop for the week when LinkedIn tells you to.
 
-**Auto mode** loads each profile on its own. It completes tasks for contacts who are already connected or pending. For new contacts, it leaves the invite ready to send.
+## Changelog
 
-**Back** returns to the previous task so you can double-check your work. It pauses Auto mode automatically so the queue doesn't jump forward again. Turn Auto mode back on to continue from where you are.
+**1.3.0**
 
-**Safety stops** prevent common mistakes:
+- Finds **Connect** under the **…** menu on LinkedIn's newer profile layout, including menus that only open on a press and menus drawn outside the profile card.
+- Clicks the actual menu item instead of the row around it.
+- Fills the prospect's email when LinkedIn asks to "enter their email to connect", and fills it again if the window redraws after "Add a note".
+- Fixed the HubSpot email being read with its label stuck on the front (`Emailname@…`).
+- LinkedIn links are cleaned up before use (country subdomains like `ph.linkedin.com`, links without `https://`, tracking parameters).
+- HubSpot arrows are found on either side of `Task N/M`, and buttons like Close are never mistaken for them.
+- "Complete registered" is checked right where the Complete button was, so an old "Completed" item further down the timeline can't fool it.
+- Tasks with the same LinkedIn link as the previous task are flagged instead of sent.
+- "Close to the weekly limit" warnings and sign-in pages turn Auto off. Running out of free monthly notes is detected.
+- Automatic results are ignored once Auto is off, and every result is checked against the task it was sent for.
+- The helper tab is found with a quick ping, the newest helper tab takes over, and an older one goes fully quiet.
+- The LinkedIn panel shows HubSpot's status.
+- Stays quick when Chrome slows down background tabs.
 
-- If LinkedIn shows its invitation-limit warning, the script stops and turns off Auto mode.
-- If a task has no LinkedIn URL, the script flags it instead of guessing.
-- If a link redirects to a different profile, the script flags it instead of auto-completing.
-- The PTG sender address is never used as the prospect's email.
+**1.2.0**
 
-## Installation
-
-1. Install the **Tampermonkey** extension for Chrome.
-2. Go to `chrome://extensions`, open Tampermonkey's **Details**, and turn on **Allow User Scripts**. On older versions of Chrome, turn on **Developer mode** instead.
-3. Open the Tampermonkey dashboard and create a new script.
-4. Replace the template with the contents of `ptg-connect-helper.user.js` and save.
-
-## Usage
-
-1. Open **Tasks** in HubSpot and start the task queue.
-2. Click **Open LinkedIn** in the green panel once. This opens the LinkedIn helper tab.
-3. Move that tab into its own window and place the HubSpot and LinkedIn windows side by side. Both need to stay visible, because Chrome slows down hidden tabs.
-4. Run a few tasks with Auto mode off to check that everything works.
-5. Turn Auto mode on.
-
-### Controls
-
-| Where | Key | Action |
-|---|---|---|
-| HubSpot | Alt+L | Open the task's LinkedIn profile |
-| HubSpot | Alt+X | Complete the task and go to the next one |
-| HubSpot | Alt+B | Go back to the previous task (pauses Auto mode) |
-| HubSpot | Alt+S | Skip to the next task without completing |
-| LinkedIn | Alt+C | Prepare the connection request with the note |
-| LinkedIn | Enter | Send the invite after checking the name |
-| LinkedIn | Alt+X | Mark the task done in HubSpot |
-| LinkedIn | Alt+B | Go back to the previous task in HubSpot |
-| LinkedIn | Alt+S | Skip to the next task |
-
-## Configuration
-
-The connection note and the timing values live in the **SETTINGS** block at the top of the script. LinkedIn allows notes of up to 300 characters.
-
-## Limitations
-
-**Page layout changes.** The script finds buttons by their text, accessibility labels, and position rather than by fixed CSS classes. Even so, a large redesign of HubSpot or LinkedIn may require updates.
-
-**Weekly invitation limits.** LinkedIn caps how many invitations an account can send each week. A long queue may need to be spread across several weeks.
-
-**Sequence tasks.** Completing a HubSpot sequence task advances the sequence. For example, completing an email task without sending the email skips that email step.
-
-## Tech
-
-The script is plain JavaScript with no dependencies. It uses Tampermonkey's `GM_*` APIs to pass messages between the HubSpot and LinkedIn tabs.
+- First working version: HubSpot task queue to LinkedIn helper tab, Auto mode, hotkeys, weekly limit stop.
 
 ## Credits
 
-Designed and built by Eightrhio Camus with AI assistance from Claude (Anthropic). Eightrhio defined the workflow and requirements and tested the script against the live HubSpot queue. Claude helped design the approach and write the code.
-
-This project is not affiliated with HubSpot or LinkedIn. Use it in line with each platform's terms.
+Built by **Patricia Camus** with AI assistance from **Claude** (Anthropic).
